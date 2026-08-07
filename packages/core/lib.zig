@@ -8,6 +8,10 @@ pub const move = @import("move.zig");
 pub const movelist = @import("movelist.zig");
 pub const attacks = @import("attacks.zig");
 pub const movegen = @import("movegen.zig");
+pub const zobrist = @import("zobrist.zig");
+pub const repetition = @import("repetition.zig");
+pub const tt = @import("tt.zig");
+pub const perft = @import("perft.zig");
 
 // Re-export commonly used types at core root for convenience
 pub const Color = piece.Color;
@@ -35,4 +39,8 @@ test {
     _ = @import("movelist.zig");
     _ = @import("attacks.zig");
     _ = @import("movegen.zig");
+    _ = @import("zobrist.zig");
+    _ = @import("repetition.zig");
+    _ = @import("tt.zig");
+    _ = @import("perft.zig");
 }

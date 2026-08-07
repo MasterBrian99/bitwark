@@ -230,9 +230,9 @@ fn generateKingMoves(board: Board, king_bb: Bitboard, stm: Color, us: Bitboard, 
     }
 }
 
-// ── Make move on copy (for legality filtering) ────────────────────────
+// ── Make move on copy (for legality filtering & perft) ────────────────────────
 
-fn applyMove(board: *Board, m: Move) void {
+pub fn applyMove(board: *Board, m: Move) void {
     const stm = board.side_to_move;
     const moving = board.pieceAt(m.from) orelse return;
     // Remove from
@@ -314,6 +314,8 @@ fn applyMove(board: *Board, m: Move) void {
     if (stm == .black) board.fullmove_number +|= 1;
     // Flip side
     board.side_to_move = stm.opposite();
+    // Recompute hash (incremental would be more efficient, but recompute ensures correctness for now)
+    board.hash = board.computeHash();
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────

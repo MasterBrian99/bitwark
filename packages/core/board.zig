@@ -3,6 +3,7 @@ const piece_mod = @import("piece.zig");
 const square_mod = @import("square.zig");
 const bitboard_mod = @import("bitboard.zig");
 const castling_mod = @import("castling.zig");
+const zobrist_mod = @import("zobrist.zig");
 
 pub const Color = piece_mod.Color;
 pub const Piece = piece_mod.Piece;
@@ -34,9 +35,10 @@ pub const Board = struct {
     en_passant: ?Square,
     halfmove_clock: u8,
     fullmove_number: u16,
+    hash: u64,
 
     pub fn empty() Board {
-        return .{
+        var b: Board = .{
             .pieces = [_]Bitboard{Bitboard.empty} ** Piece.count,
             .occupancies = [_]Bitboard{Bitboard.empty} ** Color.count,
             .occupied_all = Bitboard.empty,
@@ -45,7 +47,10 @@ pub const Board = struct {
             .en_passant = null,
             .halfmove_clock = 0,
             .fullmove_number = 1,
+            .hash = 0,
         };
+        b.hash = b.computeHash();
+        return b;
     }
 
     /// Standard starting position (rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1)
@@ -84,6 +89,7 @@ pub const Board = struct {
         b.halfmove_clock = 0;
         b.fullmove_number = 1;
         b.recalcOccupancy();
+        b.hash = b.computeHash();
         return b;
     }
 
@@ -120,6 +126,39 @@ pub const Board = struct {
         return !self.isOccupied(sq);
     }
 
+    // ── Zobrist hash ─────────────────────────────────────────────────────
+
+    pub fn computeHash(self: Board) u64 {
+        var h: u64 = 0;
+        for (0..12) |p| {
+            var bb = self.pieces[p].bits;
+            while (bb != 0) {
+                const sq: u6 = @intCast(@ctz(bb));
+                h ^= zobrist_mod.piece_keys[p][sq];
+                bb &= bb - 1;
+            }
+        }
+        if (self.side_to_move == .black) h ^= zobrist_mod.side_key;
+        h ^= zobrist_mod.castling_keys[castlingIndex(self.castling)];
+        if (self.en_passant) |ep| {
+            h ^= zobrist_mod.en_passant_keys[@intFromEnum(ep.file())];
+        }
+        return h;
+    }
+
+    inline fn castlingIndex(cr: CastlingRights) usize {
+        var idx: usize = 0;
+        if (cr.white_kingside) idx |= 1;
+        if (cr.white_queenside) idx |= 2;
+        if (cr.black_kingside) idx |= 4;
+        if (cr.black_queenside) idx |= 8;
+        return idx;
+    }
+
+    pub fn recomputeHash(self: *Board) void {
+        self.hash = self.computeHash();
+    }
+
     // ── Piece placement ──────────────────────────────────────────────────
 
     /// Return piece on square, if any. Linear scan over 12 bitboards —
@@ -140,7 +179,7 @@ pub const Board = struct {
     }
 
     /// Place piece on square. Assumes square was empty (debug assert).
-    /// Updates occupancies incrementally.
+    /// Updates occupancies and hash incrementally.
     pub fn setPiece(self: *Board, sq: Square, piece: Piece) void {
         std.debug.assert(self.pieceAt(sq) == null);
         const idx = @intFromEnum(piece);
@@ -149,6 +188,7 @@ pub const Board = struct {
         self.pieces[idx].bits |= bit.bits;
         self.occupancies[color_idx].bits |= bit.bits;
         self.occupied_all.bits |= bit.bits;
+        self.hash ^= zobrist_mod.piece_keys[idx][@intFromEnum(sq)];
     }
 
     /// Remove piece from square. Returns removed piece or null.
@@ -158,10 +198,9 @@ pub const Board = struct {
         const color_idx = @intFromEnum(piece.color());
         const bit = Bitboard.fromSquare(sq);
         self.pieces[idx].bits &= ~bit.bits;
-        // We must check if another piece of same color still occupies
-        // — but since squares hold at most one piece, we can just clear.
         self.occupancies[color_idx].bits &= ~bit.bits;
         self.occupied_all.bits &= ~bit.bits;
+        self.hash ^= zobrist_mod.piece_keys[idx][@intFromEnum(sq)];
         return piece;
     }
 
@@ -171,13 +210,13 @@ pub const Board = struct {
     pub fn movePiece(self: *Board, from: Square, to: Square) ?Piece {
         const moving = self.removePiece(from) orelse return null;
         const captured = self.removePiece(to);
-        // place moving piece on destination (reusing setPiece logic but we know `to` now empty)
         const idx = @intFromEnum(moving);
         const color_idx = @intFromEnum(moving.color());
         const bit = Bitboard.fromSquare(to);
         self.pieces[idx].bits |= bit.bits;
         self.occupancies[color_idx].bits |= bit.bits;
         self.occupied_all.bits |= bit.bits;
+        self.hash ^= zobrist_mod.piece_keys[idx][@intFromEnum(to)];
         return captured;
     }
 
@@ -228,8 +267,9 @@ pub const Board = struct {
         std.debug.print("  Halfmove: {d}  Fullmove: {d}\n", .{ self.halfmove_clock, self.fullmove_number });
     }
 
-    /// Simple equality — checks all bitboards + state
+    /// Simple equality — checks all bitboards + state + hash
     pub fn eql(self: Board, other: Board) bool {
+        if (self.hash != other.hash) return false;
         if (self.side_to_move != other.side_to_move) return false;
         if (!std.meta.eql(self.castling, other.castling)) return false;
         if (!std.meta.eql(self.en_passant, other.en_passant)) return false;

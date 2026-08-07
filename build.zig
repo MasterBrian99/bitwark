@@ -23,8 +23,8 @@ pub fn build(b: *std.Build) void {
     const apps = [_]AppSpec{
         .{ .name = "bitwark", .dir = "bitwark", .uses_protocol = false },
         .{ .name = "bitwark-bench", .dir = "bitwark-bench", .uses_protocol = false },
+        .{ .name = "bitwark-perft", .dir = "bitwark-perft", .uses_protocol = false },
         // .{ .name = "bitwark-dump", .dir = "bitwark-dump", .uses_protocol = false },
-        // .{ .name = "bitwark-perft", .dir = "bitwark-perft", .uses_protocol = false },
         // .{ .name = "bitwark-eval", .dir = "bitwark-eval", .uses_protocol = false },
         // .{ .name = "bitwark-replay", .dir = "bitwark-replay", .uses_protocol = false },
         // .{ .name = "bitwark-cli", .dir = "bitwark-cli", .uses_protocol = false },

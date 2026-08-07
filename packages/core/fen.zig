@@ -110,6 +110,9 @@ pub fn parseFenInto(fen: []const u8, out: *Board) FenError!void {
     // 6. Fullmove number
     board.fullmove_number = try parseFullmove(fullmove_str);
 
+    // Recompute hash after all fields set (incremental pieces already updated)
+    board.hash = board.computeHash();
+
     // Legality checks (explicit full-position)
     try checkLegality(board);
 
