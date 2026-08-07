@@ -59,9 +59,7 @@ pub fn build(b: *std.Build) void {
             run_step.dependOn(&run_cmd.step);
         }
     }
-    //   const core_tests = b.addTest(.{ .root_module = core_mod });
-    // test_step.dependOn(&b.addRunArtifact(core_tests).step);
-
-    // const protocol_tests = b.addTest(.{ .root_module = protocol_mod });
-    // test_step.dependOn(&b.addRunArtifact(protocol_tests).step);
+    const test_step = b.step("test", "Run all tests");
+    const core_tests = b.addTest(.{ .root_module = core_mod });
+    test_step.dependOn(&b.addRunArtifact(core_tests).step);
 }

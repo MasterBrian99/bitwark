@@ -1,254 +1,311 @@
-pub const Color = enum(u1) {
-    white,
-    black,
+const std = @import("std");
+const piece_mod = @import("piece.zig");
+const square_mod = @import("square.zig");
+const bitboard_mod = @import("bitboard.zig");
+const castling_mod = @import("castling.zig");
 
-    pub const count = 2;
-    pub fn char(self: Color) u8 {
-        return switch (self) {
-            .white => 'w',
-            .black => 'b',
+pub const Color = piece_mod.Color;
+pub const Piece = piece_mod.Piece;
+pub const PieceType = piece_mod.PieceType;
+pub const Square = square_mod.Square;
+pub const File = square_mod.File;
+pub const Rank = square_mod.Rank;
+pub const Bitboard = bitboard_mod.Bitboard;
+pub const CastlingRights = castling_mod.CastlingRights;
+
+/// Classical 8x8 board representation.
+///
+/// We use 12 bitboards (one per Piece) + 2 colour occupancies + combined.
+/// This is the standard hybrid representation: fast for move gen,
+/// simple to reason about while learning. Later we can add incremental
+/// Zobrist, mailboxes, etc.
+pub const Board = struct {
+    /// pieces[Piece.index] -> bitboard of that piece
+    pieces: [Piece.count]Bitboard,
+
+    /// occupancies[0] = white, [1] = black
+    occupancies: [Color.count]Bitboard,
+
+    /// All occupied squares (white | black) — cached for speed
+    occupied_all: Bitboard,
+
+    side_to_move: Color,
+    castling: CastlingRights,
+    en_passant: ?Square,
+    halfmove_clock: u8,
+    fullmove_number: u16,
+
+    pub fn empty() Board {
+        return .{
+            .pieces = [_]Bitboard{Bitboard.empty} ** Piece.count,
+            .occupancies = [_]Bitboard{Bitboard.empty} ** Color.count,
+            .occupied_all = Bitboard.empty,
+            .side_to_move = .white,
+            .castling = CastlingRights.none,
+            .en_passant = null,
+            .halfmove_clock = 0,
+            .fullmove_number = 1,
         };
     }
 
-    pub fn name(self: Color) []const u8 {
-        return switch (self) {
-            .white => "white",
-            .black => "black",
-        };
+    /// Standard starting position (rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1)
+    pub fn startingPosition() Board {
+        var b = Board.empty();
+        // White pieces - rank 1 & 2
+        b.setPiece(.a1, .white_rook);
+        b.setPiece(.b1, .white_knight);
+        b.setPiece(.c1, .white_bishop);
+        b.setPiece(.d1, .white_queen);
+        b.setPiece(.e1, .white_king);
+        b.setPiece(.f1, .white_bishop);
+        b.setPiece(.g1, .white_knight);
+        b.setPiece(.h1, .white_rook);
+        for (0..8) |f| {
+            const sq: Square = @enumFromInt(@as(u6, @intCast(f)) + @intFromEnum(Square.a2));
+            b.setPiece(sq, .white_pawn);
+        }
+        // Black pieces - rank 8 & 7
+        b.setPiece(.a8, .black_rook);
+        b.setPiece(.b8, .black_knight);
+        b.setPiece(.c8, .black_bishop);
+        b.setPiece(.d8, .black_queen);
+        b.setPiece(.e8, .black_king);
+        b.setPiece(.f8, .black_bishop);
+        b.setPiece(.g8, .black_knight);
+        b.setPiece(.h8, .black_rook);
+        for (0..8) |f| {
+            const sq: Square = @enumFromInt(@as(u6, @intCast(f)) + @intFromEnum(Square.a7));
+            b.setPiece(sq, .black_pawn);
+        }
+
+        b.side_to_move = .white;
+        b.castling = CastlingRights.all;
+        b.en_passant = null;
+        b.halfmove_clock = 0;
+        b.fullmove_number = 1;
+        b.recalcOccupancy();
+        return b;
     }
 
-    pub fn fromChar(c: u8) ?Color {
-        return switch (c) {
-            'w' => .white,
-            'b' => .black,
-            else => null,
-        };
+    // ── Occupancy helpers ────────────────────────────────────────────────
+
+    inline fn recalcOccupancy(self: *Board) void {
+        var white = Bitboard.empty;
+        var black = Bitboard.empty;
+        // white pieces are indices 0..5, black 6..11
+        for (0..6) |i| {
+            white.bits |= self.pieces[i].bits;
+        }
+        for (6..12) |i| {
+            black.bits |= self.pieces[i].bits;
+        }
+        self.occupancies[@intFromEnum(Color.white)] = white;
+        self.occupancies[@intFromEnum(Color.black)] = black;
+        self.occupied_all = Bitboard.fromRaw(white.bits | black.bits);
+    }
+
+    pub inline fn occupancyFor(self: Board, c: Color) Bitboard {
+        return self.occupancies[@intFromEnum(c)];
+    }
+
+    pub inline fn occupancyAll(self: Board) Bitboard {
+        return self.occupied_all;
+    }
+
+    pub inline fn isOccupied(self: Board, sq: Square) bool {
+        return self.occupied_all.contains(sq);
+    }
+
+    pub inline fn isEmpty(self: Board, sq: Square) bool {
+        return !self.isOccupied(sq);
+    }
+
+    // ── Piece placement ──────────────────────────────────────────────────
+
+    /// Return piece on square, if any. Linear scan over 12 bitboards —
+    /// fine for now; later we add a mailbox [64]?Piece cache.
+    pub fn pieceAt(self: Board, sq: Square) ?Piece {
+        const mask = Bitboard.fromSquare(sq);
+        for (0..Piece.count) |i| {
+            if ((self.pieces[i].bits & mask.bits) != 0) {
+                return @enumFromInt(i);
+            }
+        }
+        return null;
+    }
+
+    pub fn colorAt(self: Board, sq: Square) ?Color {
+        if (self.pieceAt(sq)) |p| return p.color();
+        return null;
+    }
+
+    /// Place piece on square. Assumes square was empty (debug assert).
+    /// Updates occupancies incrementally.
+    pub fn setPiece(self: *Board, sq: Square, piece: Piece) void {
+        std.debug.assert(self.pieceAt(sq) == null);
+        const idx = @intFromEnum(piece);
+        const color_idx = @intFromEnum(piece.color());
+        const bit = Bitboard.fromSquare(sq);
+        self.pieces[idx].bits |= bit.bits;
+        self.occupancies[color_idx].bits |= bit.bits;
+        self.occupied_all.bits |= bit.bits;
+    }
+
+    /// Remove piece from square. Returns removed piece or null.
+    pub fn removePiece(self: *Board, sq: Square) ?Piece {
+        const piece = self.pieceAt(sq) orelse return null;
+        const idx = @intFromEnum(piece);
+        const color_idx = @intFromEnum(piece.color());
+        const bit = Bitboard.fromSquare(sq);
+        self.pieces[idx].bits &= ~bit.bits;
+        // We must check if another piece of same color still occupies
+        // — but since squares hold at most one piece, we can just clear.
+        self.occupancies[color_idx].bits &= ~bit.bits;
+        self.occupied_all.bits &= ~bit.bits;
+        return piece;
+    }
+
+    /// Move piece from -> to, optionally capturing. Returns captured piece if any.
+    /// Does NOT handle special moves (castling, en passant, promotion) — those
+    /// will live in the move-execution layer.
+    pub fn movePiece(self: *Board, from: Square, to: Square) ?Piece {
+        const moving = self.removePiece(from) orelse return null;
+        const captured = self.removePiece(to);
+        // place moving piece on destination (reusing setPiece logic but we know `to` now empty)
+        const idx = @intFromEnum(moving);
+        const color_idx = @intFromEnum(moving.color());
+        const bit = Bitboard.fromSquare(to);
+        self.pieces[idx].bits |= bit.bits;
+        self.occupancies[color_idx].bits |= bit.bits;
+        self.occupied_all.bits |= bit.bits;
+        return captured;
+    }
+
+    // ── Queries ──────────────────────────────────────────────────────────
+
+    pub fn pieceCount(self: Board, piece: Piece) u7 {
+        return self.pieces[@intFromEnum(piece)].count();
+    }
+
+    pub fn countForColor(self: Board, c: Color) u7 {
+        return self.occupancyFor(c).count();
+    }
+
+    pub fn kingSquare(self: Board, c: Color) ?Square {
+        const king: Piece = if (c == .white) .white_king else .black_king;
+        const bb = self.pieces[@intFromEnum(king)];
+        if (bb.isEmpty()) return null;
+        return bb.lsb();
+    }
+
+    // ── Debug / display ──────────────────────────────────────────────────
+
+    pub fn debugPrint(self: Board) void {
+        std.debug.print("\n", .{});
+        var r: i8 = 7;
+        while (r >= 0) : (r -= 1) {
+            std.debug.print("{d} ", .{r + 1});
+            var f: u4 = 0;
+            while (f < 8) : (f += 1) {
+                const sq = Square.make(@enumFromInt(@as(u3, @intCast(f))), @enumFromInt(@as(u3, @intCast(r))));
+                if (self.pieceAt(sq)) |p| {
+                    std.debug.print("{c} ", .{p.char()});
+                } else {
+                    std.debug.print(". ", .{});
+                }
+            }
+            std.debug.print("\n", .{});
+        }
+        std.debug.print("  a b c d e f g h\n", .{});
+        std.debug.print("Side: {s}  Castling: ", .{self.side_to_move.name()});
+        var buf: [4]u8 = undefined;
+        std.debug.print("{s}", .{self.castling.toString(&buf)});
+        if (self.en_passant) |ep| {
+            std.debug.print("  En passant: {s}", .{ep.name()});
+        } else {
+            std.debug.print("  En passant: -", .{});
+        }
+        std.debug.print("  Halfmove: {d}  Fullmove: {d}\n", .{ self.halfmove_clock, self.fullmove_number });
+    }
+
+    /// Simple equality — checks all bitboards + state
+    pub fn eql(self: Board, other: Board) bool {
+        if (self.side_to_move != other.side_to_move) return false;
+        if (!std.meta.eql(self.castling, other.castling)) return false;
+        if (!std.meta.eql(self.en_passant, other.en_passant)) return false;
+        if (self.halfmove_clock != other.halfmove_clock) return false;
+        if (self.fullmove_number != other.fullmove_number) return false;
+        for (0..Piece.count) |i| {
+            if (self.pieces[i].bits != other.pieces[i].bits) return false;
+        }
+        return true;
     }
 };
 
-pub const PieceType = enum(u3) {
-    pawn,
-    knight,
-    bishop,
-    rook,
-    queen,
-    king,
+// ── Tests ────────────────────────────────────────────────────────────────
 
-    pub const count = 6;
-    pub fn char(self: PieceType) u8 {
-        return "pnbrqk"[@intFromEnum(self)];
-    }
+test "Board.empty is empty" {
+    const b = Board.empty();
+    try std.testing.expectEqual(@as(u7, 0), b.occupancyAll().count());
+    try std.testing.expect(b.pieceAt(.e4) == null);
+    try std.testing.expect(b.kingSquare(.white) == null);
+}
 
-    pub fn name(self: PieceType) []const u8 {
-        return switch (self) {
-            .pawn => "pawn",
-            .knight => "knight",
-            .bishop => "bishop",
-            .rook => "rook",
-            .queen => "queen",
-            .king => "king",
-        };
-    }
+test "Board.startingPosition piece counts" {
+    const b = Board.startingPosition();
+    // 32 pieces total
+    try std.testing.expectEqual(@as(u7, 32), b.occupancyAll().count());
+    try std.testing.expectEqual(@as(u7, 16), b.countForColor(.white));
+    try std.testing.expectEqual(@as(u7, 16), b.countForColor(.black));
+    // pawns
+    try std.testing.expectEqual(@as(u7, 8), b.pieceCount(.white_pawn));
+    try std.testing.expectEqual(@as(u7, 8), b.pieceCount(.black_pawn));
+    // kings
+    try std.testing.expectEqual(Square.e1, b.kingSquare(.white).?);
+    try std.testing.expectEqual(Square.e8, b.kingSquare(.black).?);
+    // spot checks
+    try std.testing.expectEqual(Piece.white_rook, b.pieceAt(.a1).?);
+    try std.testing.expectEqual(Piece.black_queen, b.pieceAt(.d8).?);
+    try std.testing.expect(b.pieceAt(.e4) == null);
+    try std.testing.expectEqual(CastlingRights.all, b.castling);
+    try std.testing.expectEqual(Color.white, b.side_to_move);
+    try std.testing.expect(b.en_passant == null);
+}
 
-    pub fn fromChar(c: u8) ?PieceType {
-        return switch (c) {
-            'p' => .pawn,
-            'n' => .knight,
-            'b' => .bishop,
-            'r' => .rook,
-            'q' => .queen,
-            'k' => .king,
-            else => null,
-        };
-    }
-};
-pub const Piece = enum(u4) {
-    white_pawn,
-    white_knight,
-    white_bishop,
-    white_rook,
-    white_queen,
-    white_king,
+test "Board set/remove/move" {
+    var b = Board.empty();
+    b.setPiece(.e4, .white_queen);
+    try std.testing.expectEqual(Piece.white_queen, b.pieceAt(.e4).?);
+    try std.testing.expectEqual(@as(u7, 1), b.occupancyAll().count());
 
-    black_pawn,
-    black_knight,
-    black_bishop,
-    black_rook,
-    black_queen,
-    black_king,
+    const removed = b.removePiece(.e4);
+    try std.testing.expectEqual(Piece.white_queen, removed.?);
+    try std.testing.expect(b.pieceAt(.e4) == null);
+    try std.testing.expectEqual(@as(u7, 0), b.occupancyAll().count());
 
-    pub const count = 12;
+    b.setPiece(.e2, .white_pawn);
+    b.setPiece(.e7, .black_pawn);
+    // e2-e4 like push (no capture)
+    const cap = b.movePiece(.e2, .e4);
+    try std.testing.expect(cap == null);
+    try std.testing.expect(b.pieceAt(.e2) == null);
+    try std.testing.expectEqual(Piece.white_pawn, b.pieceAt(.e4).?);
 
-    pub inline fn make(c: Color, kind: PieceType) Piece {
-        return @enumFromInt(
-            @intFromEnum(c) * 6 +
-                @intFromEnum(kind),
-        );
-    }
+    // capture
+    const cap2 = b.movePiece(.e4, .e7);
+    try std.testing.expectEqual(Piece.black_pawn, cap2.?);
+    try std.testing.expectEqual(Piece.white_pawn, b.pieceAt(.e7).?);
+}
 
-    pub inline fn color(self: Piece) Color {
-        return @enumFromInt(@intFromEnum(self) / 6);
-    }
+test "Board.debugPrint does not crash" {
+    const b = Board.startingPosition();
+    b.debugPrint();
+}
 
-    pub inline fn pieceType(self: Piece) PieceType {
-        return @enumFromInt(@intFromEnum(self) % 6);
-    }
-
-    pub fn char(self: Piece) u8 {
-        return "PNBRQKpnbrqk"[@intFromEnum(self)];
-    }
-
-    pub fn fromChar(c: u8) ?Piece {
-        return switch (c) {
-            'P' => .white_pawn,
-            'N' => .white_knight,
-            'B' => .white_bishop,
-            'R' => .white_rook,
-            'Q' => .white_queen,
-            'K' => .white_king,
-            'p' => .black_pawn,
-            'n' => .black_knight,
-            'b' => .black_bishop,
-            'r' => .black_rook,
-            'q' => .black_queen,
-            'k' => .black_king,
-            else => null,
-        };
-    }
-};
-
-pub const File = enum(u3) {
-    a,
-    b,
-    c,
-    d,
-    e,
-    f,
-    g,
-    h,
-
-    pub const count = 8;
-};
-
-pub const Rank = enum(u3) {
-    @"1",
-    @"2",
-    @"3",
-    @"4",
-    @"5",
-    @"6",
-    @"7",
-    @"8",
-
-    pub const count = 8;
-};
-
-pub const Square = enum(u6) {
-    a1,
-    b1,
-    c1,
-    d1,
-    e1,
-    f1,
-    g1,
-    h1,
-    a2,
-    b2,
-    c2,
-    d2,
-    e2,
-    f2,
-    g2,
-    h2,
-    a3,
-    b3,
-    c3,
-    d3,
-    e3,
-    f3,
-    g3,
-    h3,
-    a4,
-    b4,
-    c4,
-    d4,
-    e4,
-    f4,
-    g4,
-    h4,
-    a5,
-    b5,
-    c5,
-    d5,
-    e5,
-    f5,
-    g5,
-    h5,
-    a6,
-    b6,
-    c6,
-    d6,
-    e6,
-    f6,
-    g6,
-    h6,
-    a7,
-    b7,
-    c7,
-    d7,
-    e7,
-    f7,
-    g7,
-    h7,
-    a8,
-    b8,
-    c8,
-    d8,
-    e8,
-    f8,
-    g8,
-    h8,
-
-    pub const count = 64;
-
-    pub inline fn file(self: Square) File {
-        return @enumFromInt(@intFromEnum(self) & 7);
-    }
-
-    pub inline fn rank(self: Square) Rank {
-        return @enumFromInt(@intFromEnum(self) >> 3);
-    }
-
-    pub inline fn make(f: File, r: Rank) Square {
-        return @enumFromInt(
-            (@intFromEnum(r) << 3) |
-                @intFromEnum(f),
-        );
-    }
-    pub inline fn isValid(x: u8) bool {
-        return x < 64;
-    }
-    pub fn name(self: Square) []const u8 {
-        return names[@intFromEnum(self)];
-    }
-    pub fn fromName(n: []const u8) ?Square {
-        if (n.len != 2) return null;
-        if (n[0] < 'a' or n[0] > 'h') return null;
-        if (n[1] < '1' or n[1] > '8') return null;
-
-        return make(
-            @enumFromInt(name[0] - 'a'),
-            @enumFromInt(name[1] - '1'),
-        );
-    }
-    const names = [_][]const u8{
-        "a1", "b1", "c1", "d1", "e1", "f1", "g1", "h1",
-        "a2", "b2", "c2", "d2", "e2", "f2", "g2", "h2",
-        "a3", "b3", "c3", "d3", "e3", "f3", "g3", "h3",
-        "a4", "b4", "c4", "d4", "e4", "f4", "g4", "h4",
-        "a5", "b5", "c5", "d5", "e5", "f5", "g5", "h5",
-        "a6", "b6", "c6", "d6", "e6", "f6", "g6", "h6",
-        "a7", "b7", "c7", "d7", "e7", "f7", "g7", "h7",
-        "a8", "b8", "c8", "d8", "e8", "f8", "g8", "h8",
-    };
-};
+test "Board equality" {
+    const a = Board.startingPosition();
+    var b = Board.startingPosition();
+    try std.testing.expect(a.eql(b));
+    _ = b.removePiece(.a2);
+    try std.testing.expect(!a.eql(b));
+}
