@@ -7,6 +7,7 @@ pub const fen = @import("fen.zig");
 pub const move = @import("move.zig");
 pub const movelist = @import("movelist.zig");
 pub const attacks = @import("attacks.zig");
+pub const movegen = @import("movegen.zig");
 
 // Re-export commonly used types at core root for convenience
 pub const Color = piece.Color;
@@ -33,4 +34,5 @@ test {
     _ = @import("move.zig");
     _ = @import("movelist.zig");
     _ = @import("attacks.zig");
+    _ = @import("movegen.zig");
 }
