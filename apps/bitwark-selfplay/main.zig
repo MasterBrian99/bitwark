@@ -11,7 +11,7 @@ const usage =
     \\
     \\Options:
     \\  --fen <FEN>           Start FEN (default: startpos)
-    \\  --depth <N>           Search depth per ply (default: 3, 1..6)
+    \\  --depth <N>           Search depth per ply (default: 3, 1..12)
     \\  --moves <N>           Max plies (default: 60)
     \\  --threads <N>         Threads for parallel root (default: 1, 1..16)
     \\  --divergence <mode>   off | endgame | nobook | central | middlegame | pawn | all (default: off) 
@@ -83,8 +83,8 @@ pub fn main(init: std.process.Init) !void {
                 try stderr_w.interface.flush();
                 std.process.exit(1);
             };
-            if (depth < 1 or depth > 6) {
-                try stderr_w.interface.print("depth 1..6\n{s}", .{usage});
+            if (depth < 1 or depth > 12) {
+                try stderr_w.interface.print("depth 1..12\n{s}", .{usage});
                 try stderr_w.interface.flush();
                 std.process.exit(1);
             }
