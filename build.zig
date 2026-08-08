@@ -15,21 +15,26 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const protocol_mod = b.addModule("protocol", .{
+        .root_source_file = b.path("packages/protocol/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    protocol_mod.addImport("bitwark_core", core_mod);
+
     const AppSpec = struct {
         name: []const u8,
         dir: []const u8,
         uses_protocol: bool,
     };
     const apps = [_]AppSpec{
-        .{ .name = "bitwark", .dir = "bitwark", .uses_protocol = false },
+        .{ .name = "bitwark", .dir = "bitwark", .uses_protocol = true },
         .{ .name = "bitwark-bench", .dir = "bitwark-bench", .uses_protocol = false },
         .{ .name = "bitwark-perft", .dir = "bitwark-perft", .uses_protocol = false },
         .{ .name = "bitwark-dump", .dir = "bitwark-dump", .uses_protocol = false },
         .{ .name = "bitwark-eval", .dir = "bitwark-eval", .uses_protocol = false },
         .{ .name = "bitwark-replay", .dir = "bitwark-replay", .uses_protocol = false },
-        // .{ .name = "bitwark-eval", .dir = "bitwark-eval", .uses_protocol = false },
-        // .{ .name = "bitwark-replay", .dir = "bitwark-replay", .uses_protocol = false },
-        // .{ .name = "bitwark-cli", .dir = "bitwark-cli", .uses_protocol = false },
+        .{ .name = "bitwark-cli", .dir = "bitwark-cli", .uses_protocol = true },
         // .{ .name = "bitwark-selfplay", .dir = "bitwark-selfplay", .uses_protocol = false },
         // .{ .name = "bitwarkd", .dir = "bitwarkd", .uses_protocol = true },
     };
@@ -43,7 +48,8 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         if (app.uses_protocol) {
-            // app_mod.addImport("bitwark_protocol", protocol_mod);
+            app_mod.addImport("bitwark_protocol", protocol_mod);
+            app_mod.addImport("bitwark_core", core_mod);
         } else {
             app_mod.addImport("bitwark_core", core_mod);
         }
@@ -64,4 +70,6 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run all tests");
     const core_tests = b.addTest(.{ .root_module = core_mod });
     test_step.dependOn(&b.addRunArtifact(core_tests).step);
+    const protocol_tests = b.addTest(.{ .root_module = protocol_mod });
+    test_step.dependOn(&b.addRunArtifact(protocol_tests).step);
 }
