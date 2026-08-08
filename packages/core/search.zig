@@ -17,11 +17,25 @@ pub const SearchLimits = struct {
     threads: u8 = 1, // Phase 10c: parallel root threads (1 = single-thread deterministic)
 };
 
+pub const SearchStats = struct {
+    nodes: u64 = 0,
+    qnodes: u64 = 0,
+    beta_cutoffs: u64 = 0,
+    tt_probes: u64 = 0,
+    tt_hits: u64 = 0,
+    seldepth: u8 = 0,
+};
+
 pub const SearchResult = struct {
     bestmove: ?Move = null,
     score: i16 = 0,
     depth: u8 = 0,
     nodes: u64 = 0,
+    qnodes: u64 = 0,
+    beta_cutoffs: u64 = 0,
+    tt_probes: u64 = 0,
+    tt_hits: u64 = 0,
+    seldepth: u8 = 0,
     from_book: bool = false,
     pv: [64]Move = undefined,
     pv_len: usize = 0,
@@ -100,7 +114,7 @@ pub fn searchWithDivergence(board: Board, limits: SearchLimits, token: Cancellat
 
 fn searchWith(board: Board, limits: SearchLimits, token: CancellationToken, ph: phase_mod.GamePhase, divergence: Divergence) SearchResult {
     if (limits.threads > 1) return searchWithThreads(board, limits, token, ph, divergence);
-    var nodes: u64 = 0;
+    var stats = SearchStats{};
     var best: ?Move = null;
     var best_score: i16 = -INF;
     var pv: [64]Move = undefined;
@@ -111,7 +125,7 @@ fn searchWith(board: Board, limits: SearchLimits, token: CancellationToken, ph: 
     if (list.len == 0) {
         const in_check = isInCheck(board, board.side_to_move);
         const score: i16 = if (in_check) -MATE else 0;
-        return .{ .bestmove = null, .score = score, .depth = limits.depth, .nodes = 1 };
+        return .{ .bestmove = null, .score = score, .depth = limits.depth, .nodes = 1, .qnodes = 0, .beta_cutoffs = 0, .seldepth = limits.depth };
     }
 
     orderMovesWithDivergence(&list, ph, divergence);
@@ -120,17 +134,17 @@ fn searchWith(board: Board, limits: SearchLimits, token: CancellationToken, ph: 
         if (token.isCancelled()) break;
         var copy = board;
         movegen_mod.applyMove(&copy, m);
-        const score = -negamax(copy, limits.depth - 1, -INF, INF, &nodes, token, ph, divergence);
+        const score = -negamaxWithStats(copy, limits.depth - 1, -INF, INF, &stats, 1, token, ph, divergence);
         if (score > best_score) {
             best_score = score;
             best = m;
             pv[0] = m;
             pv_len = 1;
         }
-        if (limits.nodes) |limit| if (nodes >= limit) break;
+        if (limits.nodes) |limit| if (stats.nodes >= limit) break;
     }
 
-    var res: SearchResult = .{ .bestmove = best, .score = best_score, .depth = limits.depth, .nodes = nodes };
+    var res: SearchResult = .{ .bestmove = best, .score = best_score, .depth = limits.depth, .nodes = stats.nodes, .qnodes = stats.qnodes, .beta_cutoffs = stats.beta_cutoffs, .seldepth = @max(stats.seldepth, limits.depth) };
     if (best) |bm| {
         res.pv[0] = bm;
         res.pv_len = 1;
@@ -148,23 +162,29 @@ const ThreadContext = struct {
     local_best_score: i16 = -INF,
     local_best_move: ?Move = null,
     local_nodes: u64 = 0,
+    local_qnodes: u64 = 0,
+    local_cutoffs: u64 = 0,
+    local_seldepth: u8 = 0,
 };
 
 fn threadWorker(ctx: *ThreadContext) void {
-    var local_nodes: u64 = 0;
+    var stats = SearchStats{};
     var local_best: ?Move = null;
     var local_score: i16 = -INF;
     for (ctx.moves) |m| {
         if (ctx.token.isCancelled()) break;
         var copy = ctx.board;
         movegen_mod.applyMove(&copy, m);
-        const score = -negamax(copy, ctx.depth - 1, -INF, INF, &local_nodes, ctx.token, ctx.ph, ctx.divergence);
+        const score = -negamaxWithStats(copy, ctx.depth - 1, -INF, INF, &stats, 1, ctx.token, ctx.ph, ctx.divergence);
         if (score > local_score) {
             local_score = score;
             local_best = m;
         }
     }
-    ctx.local_nodes = local_nodes;
+    ctx.local_nodes = stats.nodes;
+    ctx.local_qnodes = stats.qnodes;
+    ctx.local_cutoffs = stats.beta_cutoffs;
+    ctx.local_seldepth = stats.seldepth;
     ctx.local_best_score = local_score;
     ctx.local_best_move = local_best;
 }
@@ -175,7 +195,7 @@ fn searchWithThreads(board: Board, limits: SearchLimits, token: CancellationToke
     if (list.len == 0) {
         const in_check = isInCheck(board, board.side_to_move);
         const score: i16 = if (in_check) -MATE else 0;
-        return .{ .bestmove = null, .score = score, .depth = limits.depth, .nodes = 1 };
+        return .{ .bestmove = null, .score = score, .depth = limits.depth, .nodes = 1, .seldepth = limits.depth };
     }
     orderMovesWithDivergence(&list, ph, divergence);
     const n_threads: usize = @min(@as(usize, limits.threads), list.len);
@@ -185,6 +205,9 @@ fn searchWithThreads(board: Board, limits: SearchLimits, token: CancellationToke
         return searchWith(board, limits1, token, ph, divergence);
     }
     var total_nodes: u64 = 0;
+    var total_qnodes: u64 = 0;
+    var total_cutoffs: u64 = 0;
+    var max_seldepth: u8 = 0;
     var best_score: i16 = -INF;
     var best_move: ?Move = null;
     var threads: [16]std.Thread = undefined;
@@ -210,9 +233,11 @@ fn searchWithThreads(board: Board, limits: SearchLimits, token: CancellationToke
         n_spawned += 1;
     }
     for (0..n_spawned) |i| threads[i].join();
-    // Merge results
     for (0..n_spawned) |i| {
         total_nodes += ctxs[i].local_nodes;
+        total_qnodes += ctxs[i].local_qnodes;
+        total_cutoffs += ctxs[i].local_cutoffs;
+        if (ctxs[i].local_seldepth > max_seldepth) max_seldepth = ctxs[i].local_seldepth;
         if (ctxs[i].local_best_move) |lb| {
             if (ctxs[i].local_best_score > best_score) {
                 best_score = ctxs[i].local_best_score;
@@ -226,24 +251,25 @@ fn searchWithThreads(board: Board, limits: SearchLimits, token: CancellationToke
         pv[0] = bm;
         pv_len = 1;
     }
-    return .{ .bestmove = best_move, .score = best_score, .depth = limits.depth, .nodes = total_nodes };
+    return .{ .bestmove = best_move, .score = best_score, .depth = limits.depth, .nodes = total_nodes, .qnodes = total_qnodes, .beta_cutoffs = total_cutoffs, .seldepth = @max(max_seldepth, limits.depth) };
 }
 
-fn negamax(board: Board, depth: u8, alpha: i16, beta: i16, nodes: *u64, token: CancellationToken, ph: phase_mod.GamePhase, divergence: Divergence) i16 {
+fn negamaxWithStats(board: Board, depth: u8, alpha: i16, beta: i16, stats: *SearchStats, ply: u8, token: CancellationToken, ph: phase_mod.GamePhase, divergence: Divergence) i16 {
     if (token.isCancelled()) return 0;
-    nodes.* += 1;
+    stats.nodes += 1;
+    if (ply > stats.seldepth) stats.seldepth = ply;
 
     var list = MoveList{};
     movegen_mod.generateLegal(board, &list);
 
     if (list.len == 0) {
         const in_check = isInCheck(board, board.side_to_move);
-        if (in_check) return -MATE + @as(i16, @intCast(64 - depth)); // mate distance not needed now
-        return 0; // stalemate
+        if (in_check) return -MATE + @as(i16, @intCast(64 - depth));
+        return 0;
     }
 
     if (depth == 0) {
-        return qsearch(board, alpha, beta, nodes, token, ph, divergence);
+        return qsearchWithStats(board, alpha, beta, stats, ply, token, ph, divergence);
     }
 
     var a = alpha;
@@ -251,23 +277,24 @@ fn negamax(board: Board, depth: u8, alpha: i16, beta: i16, nodes: *u64, token: C
     orderMovesWithDivergence(&list, ph, divergence);
     for (list.moves[0..list.len], 0..) |m, idx| {
         if (token.isCancelled()) break;
-        // Middlegame sharper pruning: late quiets at depth 2+ get reduced depth (LMR-like)
         var effective_depth = depth;
         if (divergence.middlegame_sharper_pruning and ph == .middlegame and depth >= 2 and idx >= 4 and !m.is_capture and !m.isPromotion()) {
             effective_depth -= 1;
             if (effective_depth == 0) {
                 var copy = board;
                 movegen_mod.applyMove(&copy, m);
-                const score = -qsearch(copy, -beta, -a, nodes, token, ph, divergence);
+                const score = -qsearchWithStats(copy, -beta, -a, stats, ply + 1, token, ph, divergence);
                 if (score > best) best = score;
                 if (score > a) a = score;
-                if (a >= beta) break;
+                if (a >= beta) {
+                    stats.beta_cutoffs += 1;
+                    break;
+                }
                 continue;
             }
         }
         var copy = board;
         movegen_mod.applyMove(&copy, m);
-        // Endgame pawn extension: pawn to 7th rank extends one ply in endgame
         var next_depth = effective_depth - 1;
         if (divergence.endgame_pawn_extension and ph == .endgame) {
             const pc = board.pieceAt(m.from);
@@ -275,23 +302,28 @@ fn negamax(board: Board, depth: u8, alpha: i16, beta: i16, nodes: *u64, token: C
             const to_rank: u3 = @intFromEnum(m.to.rank());
             const is_seventh = (board.side_to_move == .white and to_rank == 6) or (board.side_to_move == .black and to_rank == 1);
             if (is_pawn and is_seventh and next_depth < depth) {
-                next_depth += 1; // extend
+                next_depth += 1;
             }
         }
-        const score = -negamax(copy, next_depth, -beta, -a, nodes, token, ph, divergence);
+        const score = -negamaxWithStats(copy, next_depth, -beta, -a, stats, ply + 1, token, ph, divergence);
         if (score > best) best = score;
         if (score > a) a = score;
-        if (a >= beta) break; // beta cutoff
+        if (a >= beta) {
+            stats.beta_cutoffs += 1;
+            break;
+        }
     }
     return best;
 }
 
-fn qsearch(board: Board, alpha: i16, beta: i16, nodes: *u64, token: CancellationToken, ph: phase_mod.GamePhase, divergence: Divergence) i16 {
+fn qsearchWithStats(board: Board, alpha: i16, beta: i16, stats: *SearchStats, ply: u8, token: CancellationToken, ph: phase_mod.GamePhase, divergence: Divergence) i16 {
+    if (ply > 5) return @intCast(std.math.clamp(eval_mod.evaluateForSide(board), -30000, 30000)); // limit qsearch depth to prevent explosion in bench
     if (token.isCancelled()) return 0;
-    nodes.* += 1;
+    stats.nodes += 1;
+    stats.qnodes += 1;
+    if (ply > stats.seldepth) stats.seldepth = ply;
 
     const stand_pat = eval_mod.evaluateForSide(board);
-    // Clamp to i16
     const sp: i16 = @intCast(std.math.clamp(stand_pat, -INF, INF));
     var best = sp;
     var a = alpha;
@@ -307,12 +339,30 @@ fn qsearch(board: Board, alpha: i16, beta: i16, nodes: *u64, token: Cancellation
         if (token.isCancelled()) break;
         var copy = board;
         movegen_mod.applyMove(&copy, m);
-        const score = -qsearch(copy, -beta, -a, nodes, token, ph, divergence);
+        const score = -qsearchWithStats(copy, -beta, -a, stats, ply + 1, token, ph, divergence);
         if (score > best) best = score;
         if (score > a) a = score;
-        if (a >= beta) break;
+        if (a >= beta) {
+            stats.beta_cutoffs += 1;
+            break;
+        }
     }
     return best;
+}
+
+// Legacy wrappers kept for compatibility with any direct call sites; now delegate to stats version
+fn negamax(board: Board, depth: u8, alpha: i16, beta: i16, nodes: *u64, token: CancellationToken, ph: phase_mod.GamePhase, divergence: Divergence) i16 {
+    var stats = SearchStats{ .nodes = nodes.* };
+    const s = negamaxWithStats(board, depth, alpha, beta, &stats, 0, token, ph, divergence);
+    nodes.* = stats.nodes;
+    return s;
+}
+
+fn qsearch(board: Board, alpha: i16, beta: i16, nodes: *u64, token: CancellationToken, ph: phase_mod.GamePhase, divergence: Divergence) i16 {
+    var stats = SearchStats{ .nodes = nodes.*, .qnodes = 0 };
+    const s = qsearchWithStats(board, alpha, beta, &stats, 0, token, ph, divergence);
+    nodes.* = stats.nodes;
+    return s;
 }
 
 fn isInCheck(board: Board, color: @import("piece.zig").Color) bool {

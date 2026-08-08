@@ -13,6 +13,12 @@ pub const UciCommand = union(enum) {
     position_startpos: struct { moves: []const []const u8 },
     position_fen: struct { fen: []const u8, moves: []const []const u8 },
     go: GoParams,
+    perft: struct { depth: u32, divide: bool },
+    bench: struct { depth: ?u8 },
+    display, // `d`
+    eval,
+    compiler,
+    speedtest: struct { threads: ?u8, hash: ?u32, secs: ?u32 },
     unknown: []const u8,
 };
 
@@ -58,10 +64,29 @@ pub fn parseLine(line: []const u8, arena: std.mem.Allocator) !UciCommand {
         const name_idx = std.mem.indexOf(u8, rest, "name ");
         if (name_idx == null) return .{ .unknown = trimmed };
         const after_name = rest[name_idx.? + "name ".len ..];
+        // Handle both " value " and trailing " value" (empty value, e.g. SyzygyPath cleared)
         const value_idx = std.mem.indexOf(u8, after_name, " value ");
+        const value_idx2 = std.mem.indexOf(u8, after_name, " value");
         if (value_idx) |vi| {
             const name_part = std.mem.trim(u8, after_name[0..vi], &std.ascii.whitespace);
             const value_part = std.mem.trim(u8, after_name[vi + " value ".len ..], &std.ascii.whitespace);
+            const name_copy = try arena.dupe(u8, name_part);
+            const value_copy = try arena.dupe(u8, value_part);
+            return .{ .setoption = .{ .name = name_copy, .value = value_copy } };
+        } else if (value_idx2) |vi| {
+            // " value" at end (maybe empty or " value" without trailing space)
+            // Ensure it's at end or followed by nothing after trimming
+            const after_val = after_name[vi + " value".len ..];
+            const trimmed_after = std.mem.trim(u8, after_val, &std.ascii.whitespace);
+            if (trimmed_after.len == 0) {
+                const name_part = std.mem.trim(u8, after_name[0..vi], &std.ascii.whitespace);
+                const name_copy = try arena.dupe(u8, name_part);
+                // Empty value means clear (e.g. SyzygyPath)
+                const value_copy = try arena.dupe(u8, "");
+                return .{ .setoption = .{ .name = name_copy, .value = value_copy } };
+            }
+            const name_part = std.mem.trim(u8, after_name[0..vi], &std.ascii.whitespace);
+            const value_part = std.mem.trim(u8, after_val, &std.ascii.whitespace);
             const name_copy = try arena.dupe(u8, name_part);
             const value_copy = try arena.dupe(u8, value_part);
             return .{ .setoption = .{ .name = name_copy, .value = value_copy } };
@@ -127,6 +152,66 @@ pub fn parseLine(line: []const u8, arena: std.mem.Allocator) !UciCommand {
                 return .{ .position_fen = .{ .fen = fen_copy, .moves = &.{}} };
             }
         }
+    }
+
+    // --- Custom debug/test commands (non-standard, separate from UCI) ---
+    if (std.mem.eql(u8, trimmed, "d")) return .display;
+    if (std.mem.eql(u8, trimmed, "eval") or std.mem.eql(u8, trimmed, "e")) return .eval;
+    if (std.mem.eql(u8, trimmed, "compiler")) return .compiler;
+    if (std.mem.startsWith(u8, trimmed, "perft")) {
+        const rest = std.mem.trim(u8, if (trimmed.len > 5) trimmed[5..] else "", &std.ascii.whitespace);
+        if (rest.len == 0) return .{ .perft = .{ .depth = 0, .divide = false } }; // missing arg -> handled as error by caller
+        var it = std.mem.tokenizeScalar(u8, rest, ' ');
+        const tok = it.next() orelse return .{ .perft = .{ .depth = 0, .divide = false } };
+        const d = std.fmt.parseInt(u32, tok, 10) catch 999;
+        var divide = false;
+        while (it.next()) |t| {
+            if (std.mem.eql(u8, t, "divide")) divide = true;
+        }
+        return .{ .perft = .{ .depth = d, .divide = divide } };
+    }
+    if (std.mem.eql(u8, trimmed, "bench")) return .{ .bench = .{ .depth = null } };
+    if (std.mem.startsWith(u8, trimmed, "bench ")) {
+        const rest = std.mem.trim(u8, trimmed["bench ".len..], &std.ascii.whitespace);
+        const d = std.fmt.parseInt(u8, rest, 10) catch 255;
+        return .{ .bench = .{ .depth = d } };
+    }
+    if (std.mem.eql(u8, trimmed, "speedtest")) return .{ .speedtest = .{ .threads = null, .hash = null, .secs = null } };
+    if (std.mem.startsWith(u8, trimmed, "speedtest ")) {
+        const rest = std.mem.trim(u8, trimmed["speedtest ".len..], &std.ascii.whitespace);
+        var it = std.mem.tokenizeScalar(u8, rest, ' ');
+        var thr: ?u8 = null;
+        var h: ?u32 = null;
+        var s: ?u32 = null;
+        var has_invalid = false;
+        if (it.next()) |t| {
+            thr = std.fmt.parseInt(u8, t, 10) catch null;
+            if (thr == null) {
+                has_invalid = true;
+                thr = 255; // sentinel triggers error in caller
+            }
+        }
+        if (it.next()) |t| {
+            const parsed = std.fmt.parseInt(u32, t, 10) catch null;
+            if (parsed == null) {
+                has_invalid = true;
+                h = 9999;
+            } else h = parsed;
+        }
+        if (it.next()) |t| {
+            const parsed = std.fmt.parseInt(u32, t, 10) catch null;
+            if (parsed == null) {
+                has_invalid = true;
+                s = 9999;
+            } else s = parsed;
+        }
+        // If we saw tokens but all failed, ensure at least one invalid sentinel so caller reports error not default
+        if (has_invalid) {
+            if (thr == null) thr = 255;
+            if (h == null) h = 9999;
+            if (s == null) s = 9999;
+        }
+        return .{ .speedtest = .{ .threads = thr, .hash = h, .secs = s } };
     }
 
     if (std.mem.startsWith(u8, trimmed, "go")) {
@@ -255,4 +340,25 @@ test "uci parse debug register ponderhit" {
     try std.testing.expectEqual(false, (try parseLine("debug off", alloc)).debug);
     try std.testing.expect((try parseLine("register later", alloc)).register.later);
     try std.testing.expectEqual(UciCommand.ponderhit, try parseLine("ponderhit", alloc));
+}
+
+test "uci parse debug commands" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    try std.testing.expect((try parseLine("d", alloc)) == .display);
+    try std.testing.expect((try parseLine("eval", alloc)) == .eval);
+    try std.testing.expect((try parseLine("compiler", alloc)) == .compiler);
+    try std.testing.expect((try parseLine("bench", alloc)).bench.depth == null);
+    try std.testing.expectEqual(@as(u8, 4), (try parseLine("bench 4", alloc)).bench.depth.?);
+    try std.testing.expectEqual(@as(u32, 3), (try parseLine("perft 3", alloc)).perft.depth);
+    try std.testing.expect((try parseLine("perft 3 divide", alloc)).perft.divide);
+    try std.testing.expectEqual(@as(u8, 2), (try parseLine("speedtest 2 64 5", alloc)).speedtest.threads.?);
+}
+
+test "uci parse perft invalid" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    try std.testing.expectEqual(@as(u32, 999), (try parseLine("perft bad", alloc)).perft.depth);
 }

@@ -20,6 +20,9 @@ pub fn publishId(io: std.Io, writer: *std.Io.File.Writer) !void {
     try writer.interface.print("id author bitwark\n", .{});
     try writer.interface.print("option name Threads type spin default 1 min 1 max 16\n", .{});
     try writer.interface.print("option name Hash type spin default 16 min 1 max 1024\n", .{});
+    try writer.interface.print("option name MoveOverhead type spin default 30 min 0 max 5000\n", .{});
+    try writer.interface.print("option name Clear Hash type button\n", .{});
+    try writer.interface.print("option name SyzygyPath type string default <empty>\n", .{});
     try writer.interface.print("option name Ponder type check default false\n", .{});
     try writer.interface.print("option name UCI_Chess960 type check default false\n", .{});
     try writer.interface.print("option name MultiPV type spin default 1 min 1 max 4\n", .{});
