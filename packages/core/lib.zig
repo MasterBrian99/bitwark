@@ -13,6 +13,9 @@ pub const repetition = @import("repetition.zig");
 pub const tt = @import("tt.zig");
 pub const perft = @import("perft.zig");
 pub const eval = @import("eval.zig");
+pub const phase = @import("phase.zig");
+pub const book = @import("book.zig");
+pub const search = @import("search.zig");
 
 // Re-export commonly used types at core root for convenience
 pub const Color = piece.Color;
@@ -45,4 +48,7 @@ test {
     _ = @import("tt.zig");
     _ = @import("perft.zig");
     _ = @import("eval.zig");
+    _ = @import("phase.zig");
+    _ = @import("book.zig");
+    _ = @import("search.zig");
 }
