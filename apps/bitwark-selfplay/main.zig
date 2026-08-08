@@ -13,7 +13,7 @@ const usage =
     \\  --fen <FEN>           Start FEN (default: startpos)
     \\  --depth <N>           Search depth per ply (default: 3, 1..6)
     \\  --moves <N>           Max plies (default: 60)
-    \\  --divergence <mode>   off | endgame (default: off) 
+    \\  --divergence <mode>   off | endgame | nobook | central | all (default: off) 
     \\  --help                Show this help to stdout
     \\  --version             Show version to stdout
     \\
@@ -106,8 +106,8 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             }
             divergence_mode = args[i];
-            if (!std.mem.eql(u8, divergence_mode, "off") and !std.mem.eql(u8, divergence_mode, "endgame")) {
-                try stderr_w.interface.print("divergence off|endgame\n{s}", .{usage});
+            if (!std.mem.eql(u8, divergence_mode, "off") and !std.mem.eql(u8, divergence_mode, "endgame") and !std.mem.eql(u8, divergence_mode, "nobook") and !std.mem.eql(u8, divergence_mode, "central") and !std.mem.eql(u8, divergence_mode, "all")) {
+                try stderr_w.interface.print("divergence off|endgame|nobook|central|all\n{s}", .{usage});
                 try stderr_w.interface.flush();
                 std.process.exit(1);
             }
@@ -130,7 +130,10 @@ pub fn main(init: std.process.Init) !void {
     }
 
     var divergence = core.search.Divergence{};
-    if (std.mem.eql(u8, divergence_mode, "endgame")) divergence = core.search.Divergence.endgame_evasion_on;
+    if (std.mem.eql(u8, divergence_mode, "endgame")) divergence = core.search.Divergence.endgame_evasion_on
+    else if (std.mem.eql(u8, divergence_mode, "nobook")) divergence = core.search.Divergence.opening_nobook
+    else if (std.mem.eql(u8, divergence_mode, "central")) divergence = core.search.Divergence.opening_central_on
+    else if (std.mem.eql(u8, divergence_mode, "all")) divergence = .{ .opening_book = true, .endgame_check_evasion_qsearch = true, .opening_central_bonus = true };
 
     var plies: usize = 0;
     while (plies < max_plies) : (plies += 1) {

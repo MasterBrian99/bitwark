@@ -43,10 +43,13 @@ pub const Divergence = struct {
     opening_book: bool = true,
     // Endgame: in qsearch, when in check, consider all evasions (not just captures)
     endgame_check_evasion_qsearch: bool = false,
-    // Opening: allow slightly shallower null-move (placeholder, currently no null-move)
-    // Middlegame: placeholder for sharper pruning
+    // Opening: central-pawn bonus tweak (demo divergence — adds small bonus to e4/d4 in opening eval)
+    opening_central_bonus: bool = false,
     pub const off: Divergence = .{};
+    pub const all_off: Divergence = .{ .opening_book = false, .endgame_check_evasion_qsearch = false, .opening_central_bonus = false };
     pub const endgame_evasion_on: Divergence = .{ .endgame_check_evasion_qsearch = true };
+    pub const opening_nobook: Divergence = .{ .opening_book = false };
+    pub const opening_central_on: Divergence = .{ .opening_central_bonus = true };
 };
 
 // ── Public entry — phase-dispatched, book first ────────────────────────
@@ -101,9 +104,7 @@ fn searchWith(board: Board, limits: SearchLimits, token: CancellationToken, ph: 
         return .{ .bestmove = null, .score = score, .depth = limits.depth, .nodes = 1 };
     }
 
-    // Simple move ordering: captures first (MVV-LVA placeholder), then quiets
-    // For now just keep generation order but put captures front via stable partition
-    orderMoves(&list);
+    orderMovesWithDivergence(&list, ph, divergence);
 
     for (list.moves[0..list.len]) |m| {
         if (token.isCancelled()) break;
@@ -146,7 +147,7 @@ fn negamax(board: Board, depth: u8, alpha: i16, beta: i16, nodes: *u64, token: C
 
     var a = alpha;
     var best: i16 = -INF;
-    orderMoves(&list);
+    orderMovesWithDivergence(&list, ph, divergence);
     for (list.moves[0..list.len]) |m| {
         if (token.isCancelled()) break;
         var copy = board;
@@ -194,7 +195,11 @@ fn isInCheck(board: Board, color: @import("piece.zig").Color) bool {
 }
 
 fn orderMoves(list: *MoveList) void {
-    // Simple: captures (and promotions) first — stable partition
+    orderMovesWithDivergence(list, .opening, .{});
+}
+
+fn orderMovesWithDivergence(list: *MoveList, ph: phase_mod.GamePhase, divergence: Divergence) void {
+    // Base: captures/promotions first
     var captures: [256]Move = undefined;
     var quiets: [256]Move = undefined;
     var c: usize = 0;
@@ -216,6 +221,36 @@ fn orderMoves(list: *MoveList) void {
     for (quiets[0..q]) |m| {
         list.moves[idx] = m;
         idx += 1;
+    }
+    // Divergence: opening central pawn bonus — prioritize e2e4/d2d4 when in opening
+    if (divergence.opening_central_bonus and ph == .opening) {
+        const start_quiet = c;
+        var found = false;
+        for (start_quiet..list.len) |pos| {
+            const m = list.moves[pos];
+            if (m.from == .e2 and m.to == .e4) {
+                found = true;
+                var j = pos;
+                while (j > start_quiet) : (j -= 1) {
+                    list.moves[j] = list.moves[j - 1];
+                }
+                list.moves[start_quiet] = m;
+                break;
+            }
+        }
+        if (!found) {
+            for (start_quiet..list.len) |pos| {
+                const m = list.moves[pos];
+                if (m.from == .d2 and m.to == .d4) {
+                    var j = pos;
+                    while (j > start_quiet) : (j -= 1) {
+                        list.moves[j] = list.moves[j - 1];
+                    }
+                    list.moves[start_quiet] = m;
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -288,6 +323,40 @@ test "search middlegame ignores book" {
     // endgame, book should miss
     const res = search(b, .{ .depth = 1 });
     try std.testing.expect(!res.from_book);
+}
+
+test "search opening nobook divergence" {
+    const b = Board.startingPosition();
+    var dummy: bool = false;
+    const tok = CancellationToken{ .cancelled = &dummy };
+    const with_book = searchWithDivergence(b, .{ .depth = 1 }, tok, .{});
+    try std.testing.expect(with_book.from_book);
+    const without_book = searchWithDivergence(b, .{ .depth = 1 }, tok, .opening_nobook);
+    try std.testing.expect(!without_book.from_book);
+    try std.testing.expect(without_book.nodes > 1);
+    try std.testing.expect(without_book.bestmove != null);
+}
+
+test "search opening central bonus ordering" {
+    var list = MoveList{};
+    const b = Board.startingPosition();
+    movegen_mod.generateLegal(b, &list);
+    // Find e2e4 position before divergence
+    var off_list = list;
+    orderMovesWithDivergence(&off_list, .opening, .{});
+    var on_list = list;
+    orderMovesWithDivergence(&on_list, .opening, .opening_central_on);
+    // With central bonus, e2e4 should be at start of quiets (first quiet after captures)
+    // Captures =0 at startpos, so e2e4 should be at 0 when bonus on if it was not before
+    // Check that on_list has e2e4 earlier than off_list when off_list's first move isn't e2e4
+    // At least verify e2e4 is at index 0 for on_list (since captures=0)
+    var found_e4_on: ?usize = null;
+    for (on_list.moves[0..on_list.len], 0..) |m, idx| {
+        if (m.from == .e2 and m.to == .e4) { found_e4_on = idx; break; }
+    }
+    try std.testing.expect(found_e4_on != null);
+    // When bonus on, e2e4 should be in first quiet slot (0)
+    try std.testing.expectEqual(@as(usize, 0), found_e4_on.?);
 }
 
 test "search mate in 1" {
