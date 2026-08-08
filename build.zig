@@ -35,8 +35,8 @@ pub fn build(b: *std.Build) void {
         .{ .name = "bitwark-eval", .dir = "bitwark-eval", .uses_protocol = false },
         .{ .name = "bitwark-replay", .dir = "bitwark-replay", .uses_protocol = false },
         .{ .name = "bitwark-cli", .dir = "bitwark-cli", .uses_protocol = true },
-        // .{ .name = "bitwark-selfplay", .dir = "bitwark-selfplay", .uses_protocol = false },
-        // .{ .name = "bitwarkd", .dir = "bitwarkd", .uses_protocol = true },
+        .{ .name = "bitwark-selfplay", .dir = "bitwark-selfplay", .uses_protocol = false },
+        .{ .name = "bitwarkd", .dir = "bitwarkd", .uses_protocol = true },
     };
     const run_step = b.step("run", "Run the main bitwark executable");
     for (apps) |app| {

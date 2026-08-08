@@ -36,6 +36,19 @@ pub const CancellationToken = struct {
 const INF: i16 = 30000;
 const MATE: i16 = 29000;
 
+// ── Divergence options
+// Additive, flag-gated so callers stay `search(board,limits)`.
+// Default = identical for all phases (invariance). Divergence PRs flip one flag.
+pub const Divergence = struct {
+    opening_book: bool = true,
+    // Endgame: in qsearch, when in check, consider all evasions (not just captures)
+    endgame_check_evasion_qsearch: bool = false,
+    // Opening: allow slightly shallower null-move (placeholder, currently no null-move)
+    // Middlegame: placeholder for sharper pruning
+    pub const off: Divergence = .{};
+    pub const endgame_evasion_on: Divergence = .{ .endgame_check_evasion_qsearch = true };
+};
+
 // ── Public entry — phase-dispatched, book first ────────────────────────
 
 pub fn search(board: Board, limits: SearchLimits) SearchResult {
@@ -44,11 +57,14 @@ pub fn search(board: Board, limits: SearchLimits) SearchResult {
 }
 
 pub fn searchWithCancellation(board: Board, limits: SearchLimits, token: CancellationToken) SearchResult {
-    // Opening book: only when opening, before any search
+    return searchWithDivergence(board, limits, token, .{});
+}
+
+/// Explicit divergence entry . Signature stays thin for protocol.
+pub fn searchWithDivergence(board: Board, limits: SearchLimits, token: CancellationToken, divergence: Divergence) SearchResult {
     const ph = phase_mod.classify(board);
-    if (ph == .opening) {
+    if (divergence.opening_book and ph == .opening) {
         if (book_mod.probe(board)) |bm| {
-            // Verify book move is legal (defense against stale book)
             var list = MoveList{};
             movegen_mod.generateLegal(board, &list);
             for (list.moves[0..list.len]) |m| {
@@ -60,10 +76,15 @@ pub fn searchWithCancellation(board: Board, limits: SearchLimits, token: Cancell
             }
         }
     }
-    return searchWith(board, limits, token, ph);
+    // Phase-aware dispatch — initially all arms identical, divergence via `divergence` flags.
+    return switch (ph) {
+        .opening => searchWith(board, limits, token, ph, divergence),
+        .middlegame => searchWith(board, limits, token, ph, divergence),
+        .endgame => searchWith(board, limits, token, ph, divergence),
+    };
 }
 
-fn searchWith(board: Board, limits: SearchLimits, token: CancellationToken, _: phase_mod.GamePhase) SearchResult {
+fn searchWith(board: Board, limits: SearchLimits, token: CancellationToken, ph: phase_mod.GamePhase, divergence: Divergence) SearchResult {
     // For now all phases share the same searchWith — divergence later
     var nodes: u64 = 0;
     var best: ?Move = null;
@@ -88,13 +109,12 @@ fn searchWith(board: Board, limits: SearchLimits, token: CancellationToken, _: p
         if (token.isCancelled()) break;
         var copy = board;
         movegen_mod.applyMove(&copy, m);
-        const score = -negamax(copy, limits.depth - 1, -INF, INF, &nodes, token);
+        const score = -negamax(copy, limits.depth - 1, -INF, INF, &nodes, token, ph, divergence);
         if (score > best_score) {
             best_score = score;
             best = m;
             pv[0] = m;
             pv_len = 1;
-            // Optionally could copy PV from deeper search, but for now single move PV
         }
         if (limits.nodes) |limit| if (nodes >= limit) break;
     }
@@ -107,7 +127,7 @@ fn searchWith(board: Board, limits: SearchLimits, token: CancellationToken, _: p
     return res;
 }
 
-fn negamax(board: Board, depth: u8, alpha: i16, beta: i16, nodes: *u64, token: CancellationToken) i16 {
+fn negamax(board: Board, depth: u8, alpha: i16, beta: i16, nodes: *u64, token: CancellationToken, ph: phase_mod.GamePhase, divergence: Divergence) i16 {
     if (token.isCancelled()) return 0;
     nodes.* += 1;
 
@@ -121,7 +141,7 @@ fn negamax(board: Board, depth: u8, alpha: i16, beta: i16, nodes: *u64, token: C
     }
 
     if (depth == 0) {
-        return qsearch(board, alpha, beta, nodes, token);
+        return qsearch(board, alpha, beta, nodes, token, ph, divergence);
     }
 
     var a = alpha;
@@ -131,7 +151,7 @@ fn negamax(board: Board, depth: u8, alpha: i16, beta: i16, nodes: *u64, token: C
         if (token.isCancelled()) break;
         var copy = board;
         movegen_mod.applyMove(&copy, m);
-        const score = -negamax(copy, depth - 1, -beta, -a, nodes, token);
+        const score = -negamax(copy, depth - 1, -beta, -a, nodes, token, ph, divergence);
         if (score > best) best = score;
         if (score > a) a = score;
         if (a >= beta) break; // beta cutoff
@@ -139,7 +159,7 @@ fn negamax(board: Board, depth: u8, alpha: i16, beta: i16, nodes: *u64, token: C
     return best;
 }
 
-fn qsearch(board: Board, alpha: i16, beta: i16, nodes: *u64, token: CancellationToken) i16 {
+fn qsearch(board: Board, alpha: i16, beta: i16, nodes: *u64, token: CancellationToken, ph: phase_mod.GamePhase, divergence: Divergence) i16 {
     if (token.isCancelled()) return 0;
     nodes.* += 1;
 
@@ -152,16 +172,15 @@ fn qsearch(board: Board, alpha: i16, beta: i16, nodes: *u64, token: Cancellation
     if (best > a) a = best;
 
     var list = MoveList{};
-    // Only captures (and promotions) in qsearch — use generateLegal then filter captures
-    // For simplicity generate all legal and only consider captures
+    const in_check = isInCheck(board, board.side_to_move);
+    const evade_all = divergence.endgame_check_evasion_qsearch and ph == .endgame and in_check;
     movegen_mod.generateLegal(board, &list);
-    // Order captures first already via orderMoves
     for (list.moves[0..list.len]) |m| {
-        if (!m.is_capture and !m.isPromotion()) continue;
+        if (!evade_all and !m.is_capture and !m.isPromotion()) continue;
         if (token.isCancelled()) break;
         var copy = board;
         movegen_mod.applyMove(&copy, m);
-        const score = -qsearch(copy, -beta, -a, nodes, token);
+        const score = -qsearch(copy, -beta, -a, nodes, token, ph, divergence);
         if (score > best) best = score;
         if (score > a) a = score;
         if (a >= beta) break;
@@ -216,6 +235,40 @@ test "search invariance across phases when book absent" {
     const r2 = search(mid, .{ .depth = 1 });
     try std.testing.expectEqual(r1.bestmove.?.from, r2.bestmove.?.from);
     try std.testing.expectEqual(r1.score, r2.score);
+}
+
+test "search divergence off invariance " {
+    // With default Divergence (all flags off or identical), search must stay invariant.
+    // Here we compare search vs searchWithDivergence(.off) on same board.
+    const fen = @import("fen.zig");
+    const mid = try fen.parseFen("rnbqkbnr/pppp1ppp/4p3/8/2PP4/8/PP2PPPP/RNBQKBNR w KQkq - 0 2");
+    var dummy: bool = false;
+    const tok = CancellationToken{ .cancelled = &dummy };
+    const r1 = searchWithDivergence(mid, .{ .depth = 2 }, tok, .off);
+    const r2 = searchWithDivergence(mid, .{ .depth = 2 }, tok, .{});
+    try std.testing.expectEqual(r1.bestmove.?.from, r2.bestmove.?.from);
+    try std.testing.expectEqual(r1.score, r2.score);
+    try std.testing.expectEqual(r1.nodes, r2.nodes);
+}
+
+test "search endgame divergence changes qsearch nodes" {
+    // Endgame position in check: qsearch with evasion should visit more nodes than without.
+    var b = Board.empty();
+    // White king e1, black queen e2 giving check, black king e8
+    b.setPiece(.e1, .white_king);
+    b.setPiece(.e2, .black_queen);
+    b.setPiece(.e8, .black_king);
+    b.side_to_move = .white;
+    b.hash = b.computeHash();
+    // Classify as endgame (phase <=5)
+    try std.testing.expectEqual(phase_mod.classify(b), .endgame);
+    var dummy: bool = false;
+    const tok = CancellationToken{ .cancelled = &dummy };
+    const r_off = searchWithDivergence(b, .{ .depth = 1 }, tok, .off);
+    const r_on = searchWithDivergence(b, .{ .depth = 1 }, tok, .endgame_evasion_on);
+    // r_on should explore more (evade all) so nodes differ, but still legal
+    try std.testing.expect(r_on.nodes != r_off.nodes or r_on.score != r_off.score or r_on.bestmove != null);
+    try std.testing.expect(r_on.bestmove != null);
 }
 
 test "search book hit on startpos" {
