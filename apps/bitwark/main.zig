@@ -90,7 +90,7 @@ pub fn main(init: std.process.Init) !void {
                 }
                 defer controller.endSearch();
                 const limits = core.search.SearchLimits{ .depth = d };
-                const res = core.search.searchWithCancellation(session.board, limits, .{ .cancelled = &struct { var dummy: bool = false; } .dummy });
+                const res = core.search.searchWithCancellation(session.board, limits, .{ .cancelled = &struct { var dummy = std.atomic.Value(bool).init(false); } .dummy });
                 if (res.bestmove) |bm| {
                     var buf: [5]u8 = undefined;
                     const uci = bm.toUci(&buf);
@@ -112,7 +112,7 @@ pub fn main(init: std.process.Init) !void {
                 defer controller.endSearch();
                 _ = ms;
                 const limits = core.search.SearchLimits{ .depth = 4 };
-                const res = core.search.searchWithCancellation(session.board, limits, .{ .cancelled = &struct { var dummy: bool = false; } .dummy });
+                const res = core.search.searchWithCancellation(session.board, limits, .{ .cancelled = &struct { var dummy = std.atomic.Value(bool).init(false); } .dummy });
                 if (res.bestmove) |bm| {
                     var buf: [5]u8 = undefined;
                     try proto.events.publishBestmove(io, &stdout_w, bm.toUci(&buf));

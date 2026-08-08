@@ -13,7 +13,8 @@ const usage =
     \\  --fen <FEN>           Start FEN (default: startpos)
     \\  --depth <N>           Search depth per ply (default: 3, 1..6)
     \\  --moves <N>           Max plies (default: 60)
-    \\  --divergence <mode>   off | endgame | nobook | central | all (default: off) 
+    \\  --threads <N>         Threads for parallel root (default: 1, 1..16)
+    \\  --divergence <mode>   off | endgame | nobook | central | middlegame | pawn | all (default: off) 
     \\  --help                Show this help to stdout
     \\  --version             Show version to stdout
     \\
@@ -50,6 +51,7 @@ pub fn main(init: std.process.Init) !void {
     var fen_opt: ?[]const u8 = null;
     var depth: u8 = 3;
     var max_plies: usize = 60;
+    var threads: u8 = 1;
     var divergence_mode: []const u8 = "off";
 
     var i: usize = 1;
@@ -98,6 +100,23 @@ pub fn main(init: std.process.Init) !void {
                 try stderr_w.interface.flush();
                 std.process.exit(1);
             };
+        } else if (std.mem.eql(u8, a, "--threads")) {
+            i += 1;
+            if (i >= args.len) {
+                try stderr_w.interface.print("missing --threads value\n{s}", .{usage});
+                try stderr_w.interface.flush();
+                std.process.exit(1);
+            }
+            threads = std.fmt.parseInt(u8, args[i], 10) catch {
+                try stderr_w.interface.print("invalid --threads\n{s}", .{usage});
+                try stderr_w.interface.flush();
+                std.process.exit(1);
+            };
+            if (threads < 1 or threads > 16) {
+                try stderr_w.interface.print("threads 1..16\n{s}", .{usage});
+                try stderr_w.interface.flush();
+                std.process.exit(1);
+            }
         } else if (std.mem.eql(u8, a, "--divergence")) {
             i += 1;
             if (i >= args.len) {
@@ -106,8 +125,8 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             }
             divergence_mode = args[i];
-            if (!std.mem.eql(u8, divergence_mode, "off") and !std.mem.eql(u8, divergence_mode, "endgame") and !std.mem.eql(u8, divergence_mode, "nobook") and !std.mem.eql(u8, divergence_mode, "central") and !std.mem.eql(u8, divergence_mode, "all")) {
-                try stderr_w.interface.print("divergence off|endgame|nobook|central|all\n{s}", .{usage});
+            if (!std.mem.eql(u8, divergence_mode, "off") and !std.mem.eql(u8, divergence_mode, "endgame") and !std.mem.eql(u8, divergence_mode, "nobook") and !std.mem.eql(u8, divergence_mode, "central") and !std.mem.eql(u8, divergence_mode, "middlegame") and !std.mem.eql(u8, divergence_mode, "pawn") and !std.mem.eql(u8, divergence_mode, "all")) {
+                try stderr_w.interface.print("divergence off|endgame|nobook|central|middlegame|pawn|all\n{s}", .{usage});
                 try stderr_w.interface.flush();
                 std.process.exit(1);
             }
@@ -133,7 +152,9 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, divergence_mode, "endgame")) divergence = core.search.Divergence.endgame_evasion_on
     else if (std.mem.eql(u8, divergence_mode, "nobook")) divergence = core.search.Divergence.opening_nobook
     else if (std.mem.eql(u8, divergence_mode, "central")) divergence = core.search.Divergence.opening_central_on
-    else if (std.mem.eql(u8, divergence_mode, "all")) divergence = .{ .opening_book = true, .endgame_check_evasion_qsearch = true, .opening_central_bonus = true };
+    else if (std.mem.eql(u8, divergence_mode, "middlegame")) divergence = core.search.Divergence.middlegame_pruning_on
+    else if (std.mem.eql(u8, divergence_mode, "pawn")) divergence = core.search.Divergence.endgame_pawn_on
+    else if (std.mem.eql(u8, divergence_mode, "all")) divergence = core.search.Divergence.all_on;
 
     var plies: usize = 0;
     while (plies < max_plies) : (plies += 1) {
@@ -148,9 +169,9 @@ pub fn main(init: std.process.Init) !void {
             try stderr_w.interface.flush();
             return;
         }
-        var dummy: bool = false;
+        var dummy = std.atomic.Value(bool).init(false);
         const tok = core.search.CancellationToken{ .cancelled = &dummy };
-        const limits = core.search.SearchLimits{ .depth = depth };
+        const limits = core.search.SearchLimits{ .depth = depth, .threads = threads };
         const res = core.search.searchWithDivergence(board, limits, tok, divergence);
         const bm = res.bestmove orelse {
             try stdout_w.interface.print("result *\n", .{});

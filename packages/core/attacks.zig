@@ -107,15 +107,24 @@ const BishopDirs = [_][2]i8{ .{ 1, 1 }, .{ 1, -1 }, .{ -1, 1 }, .{ -1, -1 } };
 const RookDirs = [_][2]i8{ .{ 1, 0 }, .{ -1, 0 }, .{ 0, 1 }, .{ 0, -1 } };
 
 pub fn bishopAttacks(sq: Square, occupied: Bitboard) Bitboard {
-    return slidingAttacks(sq, occupied, &BishopDirs);
+    // Phase 10a: magic bitboards (fallback to plain when not initialized)
+    return @import("magic.zig").bishopAttacks(sq, occupied);
 }
 
 pub fn rookAttacks(sq: Square, occupied: Bitboard) Bitboard {
-    return slidingAttacks(sq, occupied, &RookDirs);
+    return @import("magic.zig").rookAttacks(sq, occupied);
 }
 
 pub fn queenAttacks(sq: Square, occupied: Bitboard) Bitboard {
-    return Bitboard.fromRaw(bishopAttacks(sq, occupied).bits | rookAttacks(sq, occupied).bits);
+    return @import("magic.zig").queenAttacks(sq, occupied);
+}
+
+pub fn bishopAttacksPlain(sq: Square, occupied: Bitboard) Bitboard {
+    return slidingAttacks(sq, occupied, &BishopDirs);
+}
+
+pub fn rookAttacksPlain(sq: Square, occupied: Bitboard) Bitboard {
+    return slidingAttacks(sq, occupied, &RookDirs);
 }
 
 fn slidingAttacks(sq: Square, occupied: Bitboard, dirs: []const [2]i8) Bitboard {

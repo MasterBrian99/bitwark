@@ -16,6 +16,7 @@ pub const eval = @import("eval.zig");
 pub const phase = @import("phase.zig");
 pub const book = @import("book.zig");
 pub const search = @import("search.zig");
+pub const magic = @import("magic.zig");
 
 // Re-export commonly used types at core root for convenience
 pub const Color = piece.Color;
