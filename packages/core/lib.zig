@@ -12,6 +12,7 @@ pub const zobrist = @import("zobrist.zig");
 pub const repetition = @import("repetition.zig");
 pub const tt = @import("tt.zig");
 pub const perft = @import("perft.zig");
+pub const eval = @import("eval.zig");
 
 // Re-export commonly used types at core root for convenience
 pub const Color = piece.Color;
@@ -43,4 +44,5 @@ test {
     _ = @import("repetition.zig");
     _ = @import("tt.zig");
     _ = @import("perft.zig");
+    _ = @import("eval.zig");
 }
