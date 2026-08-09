@@ -4,17 +4,17 @@ const core = @import("bitwark_core");
 const VERSION = "0.1.0";
 
 const usage =
-    \\bitwark-selfplay — regression self-play (phase-aware search, divergence flags)
+    \\bitwark-selfplay — regression self-play (unified search)
     \\
     \\Usage: bitwark-selfplay [options]
-    \\       bitwark-selfplay --depth 3 [--fen <FEN>] [--moves 60] [--divergence endgame]
+    \\       bitwark-selfplay --depth 3 [--fen <FEN>] [--moves 60] [--nobook]
     \\
     \\Options:
     \\  --fen <FEN>           Start FEN (default: startpos)
     \\  --depth <N>           Search depth per ply (default: 3, 1..12)
     \\  --moves <N>           Max plies (default: 60)
     \\  --threads <N>         Threads for parallel root (default: 1, 1..16)
-    \\  --divergence <mode>   off | endgame | nobook | central | middlegame | pawn | all (default: off) 
+    \\  --nobook              Disable opening book
     \\  --help                Show this help to stdout
     \\  --version             Show version to stdout
     \\
@@ -52,7 +52,7 @@ pub fn main(init: std.process.Init) !void {
     var depth: u8 = 3;
     var max_plies: usize = 60;
     var threads: u8 = 1;
-    var divergence_mode: []const u8 = "off";
+    var nobook = false;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -117,19 +117,8 @@ pub fn main(init: std.process.Init) !void {
                 try stderr_w.interface.flush();
                 std.process.exit(1);
             }
-        } else if (std.mem.eql(u8, a, "--divergence")) {
-            i += 1;
-            if (i >= args.len) {
-                try stderr_w.interface.print("missing --divergence value\n{s}", .{usage});
-                try stderr_w.interface.flush();
-                std.process.exit(1);
-            }
-            divergence_mode = args[i];
-            if (!std.mem.eql(u8, divergence_mode, "off") and !std.mem.eql(u8, divergence_mode, "endgame") and !std.mem.eql(u8, divergence_mode, "nobook") and !std.mem.eql(u8, divergence_mode, "central") and !std.mem.eql(u8, divergence_mode, "middlegame") and !std.mem.eql(u8, divergence_mode, "pawn") and !std.mem.eql(u8, divergence_mode, "all")) {
-                try stderr_w.interface.print("divergence off|endgame|nobook|central|middlegame|pawn|all\n{s}", .{usage});
-                try stderr_w.interface.flush();
-                std.process.exit(1);
-            }
+        } else if (std.mem.eql(u8, a, "--nobook")) {
+            nobook = true;
         } else {
             try stderr_w.interface.print("unknown option: {s}\n{s}", .{ a, usage });
             try stderr_w.interface.flush();
@@ -148,14 +137,6 @@ pub fn main(init: std.process.Init) !void {
         board = core.Board.startingPosition();
     }
 
-    var divergence = core.search.Divergence{};
-    if (std.mem.eql(u8, divergence_mode, "endgame")) divergence = core.search.Divergence.endgame_evasion_on
-    else if (std.mem.eql(u8, divergence_mode, "nobook")) divergence = core.search.Divergence.opening_nobook
-    else if (std.mem.eql(u8, divergence_mode, "central")) divergence = core.search.Divergence.opening_central_on
-    else if (std.mem.eql(u8, divergence_mode, "middlegame")) divergence = core.search.Divergence.middlegame_pruning_on
-    else if (std.mem.eql(u8, divergence_mode, "pawn")) divergence = core.search.Divergence.endgame_pawn_on
-    else if (std.mem.eql(u8, divergence_mode, "all")) divergence = core.search.Divergence.all_on;
-
     var plies: usize = 0;
     while (plies < max_plies) : (plies += 1) {
         var list = core.MoveList{};
@@ -171,8 +152,8 @@ pub fn main(init: std.process.Init) !void {
         }
         var dummy = std.atomic.Value(bool).init(false);
         const tok = core.search.CancellationToken{ .cancelled = &dummy };
-        const limits = core.search.SearchLimits{ .depth = depth, .threads = threads };
-        const res = core.search.searchWithDivergence(board, limits, tok, divergence);
+        const limits = core.search.SearchLimits{ .depth = depth, .threads = threads, .use_book = !nobook };
+        const res = core.search.searchWithCancellation(board, limits, tok);
         const bm = res.bestmove orelse {
             try stdout_w.interface.print("result *\n", .{});
             try stdout_w.interface.flush();
@@ -181,7 +162,6 @@ pub fn main(init: std.process.Init) !void {
         var buf: [5]u8 = undefined;
         const uci = bm.toUci(&buf);
         try stdout_w.interface.print("{s}\n", .{uci});
-        // keep stdout line buffered but flush each ply for scriptability
         try stdout_w.interface.flush();
         try stderr_w.interface.print("ply {d} {s} phase {s} nodes {d} score {d}\n", .{ plies + 1, uci, @tagName(core.phase.classify(board)), res.nodes, res.score });
         try stderr_w.interface.flush();

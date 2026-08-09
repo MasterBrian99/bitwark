@@ -42,18 +42,13 @@ pub const BenchResult = struct {
     }
 };
 
-/// Run a single bench position with real timing. Returns BenchResult.
-/// Caller provides depth, threads, divergence.
-/// If io is provided, uses Io.Clock.awake for real timing (std.time.Timer replacement in Zig 0.16).
-pub fn runSingle(board: Board, depth: u8, threads: u8, divergence: search_mod.Divergence) BenchResult {
-    // Fallback without Io: report 1ms (tests use this path; real callers should use runSingleWithIo)
+pub fn runSingle(board: Board, limits: search_mod.SearchLimits) BenchResult {
     var dummy = std.atomic.Value(bool).init(false);
     const tok = search_mod.CancellationToken{ .cancelled = &dummy };
-    const limits = search_mod.SearchLimits{ .depth = depth, .threads = threads };
-    const res = search_mod.searchWithDivergence(board, limits, tok, divergence);
+    const res = search_mod.searchWithCancellation(board, limits, tok);
     var br = BenchResult{
         .name = "single",
-        .depth = depth,
+        .depth = limits.depth,
         .nodes = res.nodes,
         .qnodes = res.qnodes,
         .beta_cutoffs = res.beta_cutoffs,
@@ -74,19 +69,18 @@ pub fn runSingle(board: Board, depth: u8, threads: u8, divergence: search_mod.Di
     return br;
 }
 
-pub fn runSingleWithIo(io: std.Io, board: Board, depth: u8, threads: u8, divergence: search_mod.Divergence) BenchResult {
+pub fn runSingleWithIo(io: std.Io, board: Board, limits: search_mod.SearchLimits) BenchResult {
     const start = std.Io.Clock.Timestamp.now(io, .awake);
     var dummy = std.atomic.Value(bool).init(false);
     const tok = search_mod.CancellationToken{ .cancelled = &dummy };
-    const limits = search_mod.SearchLimits{ .depth = depth, .threads = threads };
-    const res = search_mod.searchWithDivergence(board, limits, tok, divergence);
+    const res = search_mod.searchWithCancellation(board, limits, tok);
     const elapsed_ns_i96 = start.untilNow(io).raw.nanoseconds;
     const elapsed_ns: u64 = if (elapsed_ns_i96 > 0) @intCast(elapsed_ns_i96) else 1;
     const elapsed_ms: u64 = @max(1, elapsed_ns / 1_000_000);
     const nps: u64 = if (elapsed_ns > 0) res.nodes * 1_000_000_000 / elapsed_ns else res.nodes;
     var br = BenchResult{
         .name = "single",
-        .depth = depth,
+        .depth = limits.depth,
         .nodes = res.nodes,
         .qnodes = res.qnodes,
         .beta_cutoffs = res.beta_cutoffs,
@@ -107,18 +101,19 @@ pub fn runSingleWithIo(io: std.Io, board: Board, depth: u8, threads: u8, diverge
     return br;
 }
 
-pub fn runSuite(depth: u8, threads: u8, divergence: search_mod.Divergence, out: []BenchResult) usize {
+pub fn runSuite(limits: search_mod.SearchLimits, out: []BenchResult) usize {
+    var limits_nobook = limits;
+    limits_nobook.use_book = false;
     var count: usize = 0;
     for (suite) |pos| {
         if (count >= out.len) break;
         const board = fen_mod.parseFen(pos.fen) catch continue;
         var dummy = std.atomic.Value(bool).init(false);
         const tok = search_mod.CancellationToken{ .cancelled = &dummy };
-        const limits = search_mod.SearchLimits{ .depth = depth, .threads = threads };
-        const res = search_mod.searchWithDivergence(board, limits, tok, divergence);
+        const res = search_mod.searchWithCancellation(board, limits_nobook, tok);
         var br = BenchResult{
             .name = pos.name,
-            .depth = depth,
+            .depth = limits.depth,
             .nodes = res.nodes,
             .qnodes = res.qnodes,
             .beta_cutoffs = res.beta_cutoffs,
@@ -142,7 +137,9 @@ pub fn runSuite(depth: u8, threads: u8, divergence: search_mod.Divergence, out: 
     return count;
 }
 
-pub fn runSuiteWithIo(io: std.Io, depth: u8, threads: u8, divergence: search_mod.Divergence, out: []BenchResult) usize {
+pub fn runSuiteWithIo(io: std.Io, limits: search_mod.SearchLimits, out: []BenchResult) usize {
+    var limits_nobook = limits;
+    limits_nobook.use_book = false;
     var count: usize = 0;
     for (suite) |pos| {
         if (count >= out.len) break;
@@ -150,15 +147,14 @@ pub fn runSuiteWithIo(io: std.Io, depth: u8, threads: u8, divergence: search_mod
         const start = std.Io.Clock.Timestamp.now(io, .awake);
         var dummy = std.atomic.Value(bool).init(false);
         const tok = search_mod.CancellationToken{ .cancelled = &dummy };
-        const limits = search_mod.SearchLimits{ .depth = depth, .threads = threads };
-        const res = search_mod.searchWithDivergence(board, limits, tok, divergence);
+        const res = search_mod.searchWithCancellation(board, limits_nobook, tok);
         const elapsed_ns_i96 = start.untilNow(io).raw.nanoseconds;
         const elapsed_ns: u64 = if (elapsed_ns_i96 > 0) @intCast(elapsed_ns_i96) else 1;
         const elapsed_ms: u64 = @max(1, elapsed_ns / 1_000_000);
         const nps: u64 = if (elapsed_ns > 0) res.nodes * 1_000_000_000 / elapsed_ns else res.nodes;
         var br = BenchResult{
             .name = pos.name,
-            .depth = depth,
+            .depth = limits.depth,
             .nodes = res.nodes,
             .qnodes = res.qnodes,
             .beta_cutoffs = res.beta_cutoffs,
@@ -192,16 +188,27 @@ test "bench suite length" {
 
 test "bench runSingle" {
     const b = try fen_mod.parseFen(suite[0].fen);
-    const r = runSingle(b, 2, 1, .{ .opening_book = false });
+    const r = runSingle(b, .{ .depth = 2, .use_book = false });
     try std.testing.expect(r.nodes > 0);
     try std.testing.expect(r.time_ms >= 1);
 }
 
 test "bench runSuite" {
     var out: [6]BenchResult = undefined;
-    const n = runSuite(1, 1, .{ .opening_book = false }, &out);
+    const n = runSuite(.{ .depth = 1, .use_book = true }, &out);
     try std.testing.expectEqual(@as(usize, 6), n);
     for (out[0..n]) |r| {
         try std.testing.expect(r.nodes > 0);
+        // suite always nobook
+        try std.testing.expect(!r.from_book);
+    }
+}
+
+test "bench runSuite forces nobook" {
+    var out: [6]BenchResult = undefined;
+    // even with use_book=true, suite must be nobook
+    const n = runSuite(.{ .depth = 1, .use_book = true }, &out);
+    for (out[0..n]) |r| {
+        try std.testing.expect(!r.from_book);
     }
 }

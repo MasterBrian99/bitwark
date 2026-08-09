@@ -27,7 +27,7 @@ pub fn main(init: std.process.Init) !void {
     var hash_mb: u32 = 16;
     var move_overhead: u32 = 30;
     var syzygy_path: ?[]const u8 = null;
-    // Keep variables alive for future phases (avoid unused warnings in Debug mode)
+    // Keep variables alive for future (avoid unused warnings in Debug mode)
     _ = &debug_on;
     _ = &move_overhead;
     _ = &syzygy_path;
@@ -218,8 +218,8 @@ pub fn main(init: std.process.Init) !void {
                     continue;
                 }
                 var out: [6]core.bench.BenchResult = undefined;
-                // startpos-nobook divergence ensures startpos not book hit; real Io timing
-                const n = core.bench.runSuiteWithIo(io, depth, threads, .{ .opening_book = false }, &out);
+                const limits = core.search.SearchLimits{ .depth = depth, .threads = threads, .use_book = false };
+                const n = core.bench.runSuiteWithIo(io, limits, &out);
                 var total_nodes: u64 = 0;
                 var total_qnodes: u64 = 0;
                 var total_cutoffs: u64 = 0;
@@ -310,8 +310,8 @@ pub fn main(init: std.process.Init) !void {
                     if (elapsed_check >= @as(i96, deadline_ns)) break;
                     var dummy = std.atomic.Value(bool).init(false);
                     const tok = core.search.CancellationToken{ .cancelled = &dummy };
-                    const limits = core.search.SearchLimits{ .depth = 4, .threads = thr };
-                    const res = core.search.searchWithDivergence(board, limits, tok, .{ .opening_book = false });
+                    const limits = core.search.SearchLimits{ .depth = 4, .threads = thr, .use_book = false };
+                    const res = core.search.searchWithCancellation(board, limits, tok);
                     total_nodes += res.nodes;
                     total_qnodes += res.qnodes;
                     iterations += 1;
@@ -346,9 +346,7 @@ pub fn main(init: std.process.Init) !void {
                         const my_time = if (stm == .white) g.wtime else g.btime;
                         const my_inc = if (stm == .white) g.winc else g.binc;
                         if (my_time) |t| {
-                            if (t < 1000) depth = 2
-                            else if (t < 5000) depth = 3
-                            else depth = 4;
+                            if (t < 1000) depth = 2 else if (t < 5000) depth = 3 else depth = 4;
                             _ = my_inc;
                         }
                     }
@@ -362,14 +360,19 @@ pub fn main(init: std.process.Init) !void {
                 }
 
                 const limits = core.search.SearchLimits{ .depth = depth, .nodes = nodes, .threads = threads_use };
-                var res = core.search.searchWithCancellation(session.board, limits, .{ .cancelled = &struct { var dummy = std.atomic.Value(bool).init(false); } .dummy });
+                var res = core.search.searchWithCancellation(session.board, limits, .{ .cancelled = &struct {
+                    var dummy = std.atomic.Value(bool).init(false);
+                }.dummy });
 
                 if (g.searchmoves) |sm| {
                     if (res.bestmove) |bm| {
                         var buf: [5]u8 = undefined;
                         const uci = bm.toUci(&buf);
                         var found = false;
-                        for (sm) |m| if (std.mem.eql(u8, m, uci)) { found = true; break; };
+                        for (sm) |m| if (std.mem.eql(u8, m, uci)) {
+                            found = true;
+                            break;
+                        };
                         if (!found and sm.len > 0) {
                             if (core.move.Move.fromUci(sm[0])) |fm| {
                                 var list = core.MoveList{};
