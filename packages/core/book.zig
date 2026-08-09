@@ -37,12 +37,6 @@ pub fn probe(board: Board) ?Move {
     return null;
 }
 
-// Variant that also takes phase gating — caller should check phase==.opening, but we expose helper.
-pub fn probeOpening(board: Board, phase: @import("phase.zig").GamePhase) ?Move {
-    if (phase != .opening) return null;
-    return probe(board);
-}
-
 test "book probe startpos" {
     const b = try fen_mod.parseFen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
     const m = probe(b).?;
@@ -56,16 +50,4 @@ test "book probe miss" {
     b.setPiece(.e8, .black_king);
     b.hash = b.computeHash();
     try std.testing.expect(probe(b) == null);
-}
-
-test "book probe not in endgame" {
-    var b = Board.empty();
-    b.setPiece(.e1, .white_king);
-    b.setPiece(.e8, .black_king);
-    b.setPiece(.a2, .white_pawn);
-    b.hash = b.computeHash();
-    // Even if hash matched, probeOpening should filter by phase
-    const ph = @import("phase.zig").classify(b);
-    try std.testing.expectEqual(@import("phase.zig").GamePhase.endgame, ph);
-    try std.testing.expect(probeOpening(b, ph) == null);
 }

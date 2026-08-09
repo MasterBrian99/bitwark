@@ -16,7 +16,12 @@ pub const eval = @import("eval.zig");
 pub const phase = @import("phase.zig");
 pub const book = @import("book.zig");
 pub const search = @import("search.zig");
+pub const config = @import("config.zig");
+pub const engine = @import("engine.zig");
 pub const magic = @import("magic.zig");
+pub const bench = @import("bench.zig");
+pub const display = @import("display.zig");
+pub const compiler = @import("compiler.zig");
 
 // Re-export commonly used types at core root for convenience
 pub const Color = piece.Color;
@@ -52,4 +57,9 @@ test {
     _ = @import("phase.zig");
     _ = @import("book.zig");
     _ = @import("search.zig");
+    _ = @import("config.zig");
+    _ = @import("engine.zig");
+    _ = @import("bench.zig");
+    _ = @import("display.zig");
+    _ = @import("compiler.zig");
 }

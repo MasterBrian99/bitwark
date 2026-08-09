@@ -4,22 +4,24 @@ const core = @import("bitwark_core");
 const VERSION = "0.1.0";
 
 const usage =
-    \\bitwark-bench — phase-aware search benchmark (divergence flags, deterministic)
+    \\bitwark-bench — unified search benchmark (shared suite, real timing)
     \\
     \\Usage: bitwark-bench [options]
-    \\       bitwark-bench --depth 4 [--fen <FEN>] [--divergence <mode>] [--nodes <N>]
+    \\       bitwark-bench --depth 4 [--suite] [--fen <FEN>] [--nobook] [--nodes <N>]
     \\
     \\Options:
-    \\  --fen <FEN>           FEN position (default: startpos)
+    \\  --fen <FEN>           Single FEN position (default: startpos, ignored with --suite)
     \\  --depth <N>           Search depth (default: 4, 1..12)
-    \\  --nodes <N>           Optional node limit
+    \\  --nodes <N>           Optional node limit (single position only)
     \\  --threads <N>         Threads for parallel root (default: 1, 1..16)
-    \\  --divergence <mode>   off | endgame | nobook | central | middlegame | pawn | all (default: off)
+    \\  --suite               Run 6-position fixed suite (ignores --fen/--nodes)
+    \\  --nobook              Disable opening book (single position only; suite is always nobook)
     \\  --help                Show this help to stdout
     \\  --version             Show version to stdout
     \\
     \\Output (stdout):
-    \\  depth <N> nodes <N> nps <N> time <ms> score <cp> bestmove <uci> phase <opening|middlegame|endgame> divergence <mode>
+    \\  depth <N> nodes <N> qnodes <N> cutoffs <N> seldepth <N> nps <N> time <ms> score <cp> bestmove <uci> phase <opening|middlegame|endgame> threads <N>
+    \\  suite line: bench <name> depth <d> nodes <n> qnodes <n> cutoffs <n> seldepth <n> time <ms> nps <n> score <cp> bestmove <uci> phase <s>
     \\
     \\Exit codes:
     \\  0 success, 1 usage error, 2 FEN error
@@ -52,7 +54,8 @@ pub fn main(init: std.process.Init) !void {
     var depth: u8 = 4;
     var nodes_limit: ?u64 = null;
     var threads: u8 = 1;
-    var divergence_mode: []const u8 = "off";
+    var nobook = false;
+    var suite_mode = false;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -63,6 +66,10 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, a, "--version") or std.mem.eql(u8, a, "-V")) {
             try printVersion(io, &stdout_w);
             return;
+        } else if (std.mem.eql(u8, a, "--suite")) {
+            suite_mode = true;
+        } else if (std.mem.eql(u8, a, "--nobook")) {
+            nobook = true;
         } else if (std.mem.eql(u8, a, "--fen")) {
             i += 1;
             if (i >= args.len) {
@@ -117,24 +124,40 @@ pub fn main(init: std.process.Init) !void {
                 try stderr_w.interface.flush();
                 std.process.exit(1);
             }
-        } else if (std.mem.eql(u8, a, "--divergence")) {
-            i += 1;
-            if (i >= args.len) {
-                try stderr_w.interface.print("missing --divergence value\n{s}", .{usage});
-                try stderr_w.interface.flush();
-                std.process.exit(1);
-            }
-            divergence_mode = args[i];
-            if (!std.mem.eql(u8, divergence_mode, "off") and !std.mem.eql(u8, divergence_mode, "endgame") and !std.mem.eql(u8, divergence_mode, "nobook") and !std.mem.eql(u8, divergence_mode, "central") and !std.mem.eql(u8, divergence_mode, "middlegame") and !std.mem.eql(u8, divergence_mode, "pawn") and !std.mem.eql(u8, divergence_mode, "all")) {
-                try stderr_w.interface.print("divergence off|endgame|nobook|central|middlegame|pawn|all\n{s}", .{usage});
-                try stderr_w.interface.flush();
-                std.process.exit(1);
-            }
         } else {
             try stderr_w.interface.print("unknown option: {s}\n{s}", .{ a, usage });
             try stderr_w.interface.flush();
             std.process.exit(1);
         }
+    }
+
+    // Build shared config from CLI flags (threads + nobook map into EngineConfig)
+    const cfg = core.config.EngineConfig{ .threads = threads, .use_opening_book = !nobook };
+
+    if (suite_mode) {
+        var out: [6]core.bench.BenchResult = undefined;
+        const limits = core.search.SearchLimits{ .depth = depth, .threads = cfg.threads, .use_book = false };
+        const n = core.bench.runSuiteWithIo(io, limits, &out);
+        var total_nodes: u64 = 0;
+        var total_qnodes: u64 = 0;
+        var total_cutoffs: u64 = 0;
+        var total_ms: u64 = 0;
+        for (out[0..n]) |r| {
+            var best_tmp: [5]u8 = undefined;
+            const best_src = r.bestUci();
+            @memcpy(best_tmp[0..best_src.len], best_src);
+            const best_uci = best_tmp[0..best_src.len];
+            const book_str: []const u8 = if (r.from_book) " book" else "";
+            try stdout_w.interface.print("bench {s} depth {d} nodes {d} qnodes {d} cutoffs {d} seldepth {d} time {d} nps {d} score {d} bestmove {s} phase {s}{s}\n", .{ r.name, r.depth, r.nodes, r.qnodes, r.beta_cutoffs, r.seldepth, r.time_ms, r.nps, r.score, best_uci, @tagName(r.phase), book_str });
+            total_nodes += r.nodes;
+            total_qnodes += r.qnodes;
+            total_cutoffs += r.beta_cutoffs;
+            total_ms += r.time_ms;
+        }
+        const total_nps: u64 = if (total_ms > 0) total_nodes * 1000 / total_ms else total_nodes;
+        try stdout_w.interface.print("total nodes {d} qnodes {d} cutoffs {d} time {d} nps {d} threads {d}\n", .{ total_nodes, total_qnodes, total_cutoffs, total_ms, total_nps, cfg.threads });
+        try stdout_w.interface.flush();
+        return;
     }
 
     var board: core.Board = undefined;
@@ -148,28 +171,21 @@ pub fn main(init: std.process.Init) !void {
         board = core.Board.startingPosition();
     }
 
-    var divergence = core.search.Divergence{};
-    if (std.mem.eql(u8, divergence_mode, "endgame")) divergence = core.search.Divergence.endgame_evasion_on
-    else if (std.mem.eql(u8, divergence_mode, "nobook")) divergence = core.search.Divergence.opening_nobook
-    else if (std.mem.eql(u8, divergence_mode, "central")) divergence = core.search.Divergence.opening_central_on
-    else if (std.mem.eql(u8, divergence_mode, "middlegame")) divergence = core.search.Divergence.middlegame_pruning_on
-    else if (std.mem.eql(u8, divergence_mode, "pawn")) divergence = core.search.Divergence.endgame_pawn_on
-    else if (std.mem.eql(u8, divergence_mode, "all")) divergence = core.search.Divergence.all_on;
-
     const phase = core.phase.classify(board);
+    const limits = core.search.SearchLimits{ .depth = depth, .nodes = nodes_limit, .threads = cfg.threads, .use_book = cfg.use_opening_book };
+    const start = std.Io.Clock.Timestamp.now(io, .awake);
     var dummy = std.atomic.Value(bool).init(false);
     const tok = core.search.CancellationToken{ .cancelled = &dummy };
-    const limits = core.search.SearchLimits{ .depth = depth, .nodes = nodes_limit, .threads = threads };
-
-    // Simple timing via Invariant — bench is deterministic, nps derived from nodes
-    const res = core.search.searchWithDivergence(board, limits, tok, divergence);
-    const elapsed: u64 = 1;
-    const nps: u64 = res.nodes;
+    const res = core.search.searchWithCancellation(board, limits, tok);
+    const elapsed_ns_i96 = start.untilNow(io).raw.nanoseconds;
+    const elapsed_ns: u64 = if (elapsed_ns_i96 > 0) @intCast(elapsed_ns_i96) else 1;
+    const elapsed_ms: u64 = @max(1, elapsed_ns / 1_000_000);
+    const nps: u64 = if (elapsed_ns > 0) res.nodes * 1_000_000_000 / elapsed_ns else res.nodes;
 
     var best_str: [5]u8 = undefined;
     const best_uci = if (res.bestmove) |bm| bm.toUci(&best_str) else "0000";
-    const from_book_str: []const u8 = if (res.from_book) " book" else "";
+    const book_str: []const u8 = if (res.from_book) " book" else "";
 
-    try stdout_w.interface.print("depth {d} nodes {d} nps {d} time {d} score {d} bestmove {s} phase {s} divergence {s} threads {d}{s}\n", .{ res.depth, res.nodes, nps, elapsed, res.score, best_uci, @tagName(phase), divergence_mode, threads, from_book_str });
+    try stdout_w.interface.print("depth {d} nodes {d} qnodes {d} cutoffs {d} seldepth {d} nps {d} time {d} score {d} bestmove {s} phase {s} threads {d}{s}\n", .{ res.depth, res.nodes, res.qnodes, res.beta_cutoffs, res.seldepth, nps, elapsed_ms, res.score, best_uci, @tagName(phase), cfg.threads, book_str });
     try stdout_w.interface.flush();
 }

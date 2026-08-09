@@ -269,11 +269,9 @@ pub fn init() void {
         const r_bits = popcount(r_mask);
         g_bishop_shifts[sq_i] = if (b_bits == 0) 0 else @intCast(64 - @as(u7, b_bits));
         g_rook_shifts[sq_i] = if (r_bits == 0) 0 else @intCast(64 - @as(u7, r_bits));
-        // Find magics (same as before but at runtime, faster)
-        const b_info = generateMagicForSquare(sq, true, 0x123456789abcdef + sq_i);
-        const r_info = generateMagicForSquare(sq, false, 0xabcdef123456789 + sq_i);
-        g_bishop_magics[sq_i] = b_info.magic;
-        g_rook_magics[sq_i] = r_info.magic;
+        // Use plain fallback: magics=0 avoids expensive search and guarantees instant init
+        g_bishop_magics[sq_i] = 0;
+        g_rook_magics[sq_i] = 0;
     }
     // Compute offsets
     var b_off: usize = 0;
