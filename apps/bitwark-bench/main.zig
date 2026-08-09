@@ -131,9 +131,12 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    // Build shared config from CLI flags (threads + nobook map into EngineConfig)
+    const cfg = core.config.EngineConfig{ .threads = threads, .use_opening_book = !nobook };
+
     if (suite_mode) {
         var out: [6]core.bench.BenchResult = undefined;
-        const limits = core.search.SearchLimits{ .depth = depth, .threads = threads, .use_book = false };
+        const limits = core.search.SearchLimits{ .depth = depth, .threads = cfg.threads, .use_book = false };
         const n = core.bench.runSuiteWithIo(io, limits, &out);
         var total_nodes: u64 = 0;
         var total_qnodes: u64 = 0;
@@ -152,7 +155,7 @@ pub fn main(init: std.process.Init) !void {
             total_ms += r.time_ms;
         }
         const total_nps: u64 = if (total_ms > 0) total_nodes * 1000 / total_ms else total_nodes;
-        try stdout_w.interface.print("total nodes {d} qnodes {d} cutoffs {d} time {d} nps {d} threads {d}\n", .{ total_nodes, total_qnodes, total_cutoffs, total_ms, total_nps, threads });
+        try stdout_w.interface.print("total nodes {d} qnodes {d} cutoffs {d} time {d} nps {d} threads {d}\n", .{ total_nodes, total_qnodes, total_cutoffs, total_ms, total_nps, cfg.threads });
         try stdout_w.interface.flush();
         return;
     }
@@ -169,7 +172,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const phase = core.phase.classify(board);
-    const limits = core.search.SearchLimits{ .depth = depth, .nodes = nodes_limit, .threads = threads, .use_book = !nobook };
+    const limits = core.search.SearchLimits{ .depth = depth, .nodes = nodes_limit, .threads = cfg.threads, .use_book = cfg.use_opening_book };
     const start = std.Io.Clock.Timestamp.now(io, .awake);
     var dummy = std.atomic.Value(bool).init(false);
     const tok = core.search.CancellationToken{ .cancelled = &dummy };
@@ -183,6 +186,6 @@ pub fn main(init: std.process.Init) !void {
     const best_uci = if (res.bestmove) |bm| bm.toUci(&best_str) else "0000";
     const book_str: []const u8 = if (res.from_book) " book" else "";
 
-    try stdout_w.interface.print("depth {d} nodes {d} qnodes {d} cutoffs {d} seldepth {d} nps {d} time {d} score {d} bestmove {s} phase {s} threads {d}{s}\n", .{ res.depth, res.nodes, res.qnodes, res.beta_cutoffs, res.seldepth, nps, elapsed_ms, res.score, best_uci, @tagName(phase), threads, book_str });
+    try stdout_w.interface.print("depth {d} nodes {d} qnodes {d} cutoffs {d} seldepth {d} nps {d} time {d} score {d} bestmove {s} phase {s} threads {d}{s}\n", .{ res.depth, res.nodes, res.qnodes, res.beta_cutoffs, res.seldepth, nps, elapsed_ms, res.score, best_uci, @tagName(phase), cfg.threads, book_str });
     try stdout_w.interface.flush();
 }

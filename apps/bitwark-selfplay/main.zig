@@ -137,6 +137,8 @@ pub fn main(init: std.process.Init) !void {
         board = core.Board.startingPosition();
     }
 
+    const cfg = core.config.EngineConfig{ .threads = threads, .use_opening_book = !nobook };
+
     var plies: usize = 0;
     while (plies < max_plies) : (plies += 1) {
         var list = core.MoveList{};
@@ -152,7 +154,7 @@ pub fn main(init: std.process.Init) !void {
         }
         var dummy = std.atomic.Value(bool).init(false);
         const tok = core.search.CancellationToken{ .cancelled = &dummy };
-        const limits = core.search.SearchLimits{ .depth = depth, .threads = threads, .use_book = !nobook };
+        const limits = core.search.SearchLimits{ .depth = depth, .threads = cfg.threads, .use_book = cfg.use_opening_book };
         const res = core.search.searchWithCancellation(board, limits, tok);
         const bm = res.bestmove orelse {
             try stdout_w.interface.print("result *\n", .{});

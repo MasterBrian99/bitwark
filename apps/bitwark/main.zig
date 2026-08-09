@@ -13,24 +13,16 @@ pub fn main(init: std.process.Init) !void {
 
     var session = proto.session.Session.init(core.Board.startingPosition());
     var controller = proto.controller.Controller{};
-    // Use page_allocator for TT so Hash resizing can realloc (arena is frame-bound)
     const tt_alloc = std.heap.page_allocator;
-    var tt = proto.table.allocTT(tt_alloc, 16 * 1024 * 1024) catch {
+    var engine = core.engine.Engine.init(tt_alloc, .{}) catch {
         try stderr_w.interface.print("error: TT alloc failed\n", .{});
         try stderr_w.interface.flush();
         return;
     };
-    defer tt.deinit(tt_alloc);
+    defer engine.deinit();
 
     var debug_on = false;
-    var threads: u8 = 1;
-    var hash_mb: u32 = 16;
-    var move_overhead: u32 = 30;
-    var syzygy_path: ?[]const u8 = null;
-    // Keep variables alive for future (avoid unused warnings in Debug mode)
     _ = &debug_on;
-    _ = &move_overhead;
-    _ = &syzygy_path;
 
     var stdin_buf: [8192]u8 = undefined;
     var stdin_reader: std.Io.File.Reader = .init(.stdin(), io, &stdin_buf);
@@ -75,65 +67,63 @@ pub fn main(init: std.process.Init) !void {
                 try proto.events.publishReadyOk(io, &stdout_w);
             },
             .setoption => |opt| {
-                if (std.mem.eql(u8, opt.name, "Threads")) {
-                    if (opt.value) |v| {
-                        const parsed = std.fmt.parseInt(u8, v, 10) catch {
-                            try proto.events.publishInfoString(io, &stdout_w, "error: invalid Threads value");
-                            continue;
-                        };
-                        if (parsed < 1 or parsed > 16) {
-                            try proto.events.publishInfoString(io, &stdout_w, "error: Threads 1..16");
-                            continue;
-                        }
-                        threads = parsed;
-                    }
-                    try proto.events.publishInfoString(io, &stdout_w, "Threads set");
-                } else if (std.mem.eql(u8, opt.name, "Hash")) {
-                    if (opt.value) |v| {
-                        const parsed = std.fmt.parseInt(u32, v, 10) catch {
-                            try proto.events.publishInfoString(io, &stdout_w, "error: invalid Hash value");
-                            continue;
-                        };
-                        if (parsed < 1 or parsed > 1024) {
-                            try proto.events.publishInfoString(io, &stdout_w, "error: Hash 1..1024");
-                            continue;
-                        }
-                        hash_mb = parsed;
-                        // Reallocate TT
-                        tt.deinit(tt_alloc);
-                        tt = proto.table.allocTT(tt_alloc, @as(usize, hash_mb) * 1024 * 1024) catch {
-                            try proto.events.publishInfoString(io, &stdout_w, "error: Hash alloc failed");
-                            // fallback to 16 MB
-                            tt = proto.table.allocTT(tt_alloc, 16 * 1024 * 1024) catch {
-                                try stderr_w.interface.print("fatal: TT alloc failed\n", .{});
-                                try stderr_w.interface.flush();
-                                return;
-                            };
-                            continue;
-                        };
-                    }
-                    try proto.events.publishInfoString(io, &stdout_w, "Hash set");
-                } else if (std.mem.eql(u8, opt.name, "Clear Hash")) {
-                    tt.clear();
+                // Gracefully accept known-unsupported options for GUI compat
+                if (std.mem.eql(u8, opt.name, "Ponder") or std.mem.eql(u8, opt.name, "UCI_Chess960") or std.mem.eql(u8, opt.name, "MultiPV")) {
+                    try proto.events.publishInfoString(io, &stdout_w, "option ok");
+                    continue;
+                }
+                // Special handling for Clear Hash button: clear TT and report done
+                if (std.mem.eql(u8, opt.name, "Clear Hash")) {
+                    engine.clearHash();
                     try proto.events.publishInfoString(io, &stdout_w, "Clear Hash done");
-                } else if (std.mem.eql(u8, opt.name, "MoveOverhead")) {
-                    if (opt.value) |v| {
-                        const parsed = std.fmt.parseInt(u32, v, 10) catch {
-                            try proto.events.publishInfoString(io, &stdout_w, "error: invalid MoveOverhead");
-                            continue;
-                        };
-                        if (parsed > 5000) {
-                            try proto.events.publishInfoString(io, &stdout_w, "error: MoveOverhead 0..5000");
-                            continue;
-                        }
-                        move_overhead = parsed;
+                    continue;
+                }
+                // SyzygyPath has special success message with probing note
+                const is_syzygy_path = std.mem.eql(u8, opt.name, "SyzygyPath");
+                engine.setOption(opt.name, opt.value) catch |err| {
+                    switch (err) {
+                        error.UnknownOption => {
+                            var buf: [256]u8 = undefined;
+                            const msg = std.fmt.bufPrint(&buf, "error: unknown option {s}", .{opt.name}) catch "error: unknown option";
+                            try proto.events.publishInfoString(io, &stdout_w, msg);
+                        },
+                        error.MissingValue => {
+                            var buf: [256]u8 = undefined;
+                            const msg = std.fmt.bufPrint(&buf, "error: missing value for {s}", .{opt.name}) catch "error: missing value";
+                            try proto.events.publishInfoString(io, &stdout_w, msg);
+                        },
+                        error.InvalidValue => {
+                            if (std.mem.eql(u8, opt.name, "Threads")) {
+                                try proto.events.publishInfoString(io, &stdout_w, "error: Threads 1..16");
+                            } else if (std.mem.eql(u8, opt.name, "Hash")) {
+                                try proto.events.publishInfoString(io, &stdout_w, "error: Hash 1..1024");
+                            } else if (std.mem.eql(u8, opt.name, "MoveOverhead")) {
+                                try proto.events.publishInfoString(io, &stdout_w, "error: MoveOverhead 0..5000");
+                            } else if (std.mem.eql(u8, opt.name, "SyzygyProbeDepth")) {
+                                try proto.events.publishInfoString(io, &stdout_w, "error: SyzygyProbeDepth 1..100");
+                            } else if (std.mem.eql(u8, opt.name, "SyzygyProbeLimit")) {
+                                try proto.events.publishInfoString(io, &stdout_w, "error: SyzygyProbeLimit 0..7");
+                            } else if (std.mem.eql(u8, opt.name, "OwnBook")) {
+                                try proto.events.publishInfoString(io, &stdout_w, "error: OwnBook true/false");
+                            } else if (std.mem.eql(u8, opt.name, "Syzygy50MoveRule")) {
+                                try proto.events.publishInfoString(io, &stdout_w, "error: Syzygy50MoveRule true/false");
+                            } else {
+                                var buf: [256]u8 = undefined;
+                                const msg = std.fmt.bufPrint(&buf, "error: invalid value for {s}", .{opt.name}) catch "error: invalid value";
+                                try proto.events.publishInfoString(io, &stdout_w, msg);
+                            }
+                        },
+                        else => {
+                            try proto.events.publishInfoString(io, &stdout_w, "error: Hash alloc failed");
+                        },
                     }
-                    try proto.events.publishInfoString(io, &stdout_w, "MoveOverhead set");
-                } else if (std.mem.eql(u8, opt.name, "SyzygyPath")) {
-                    syzygy_path = opt.value;
+                    continue;
+                };
+                if (is_syzygy_path) {
                     if (opt.value) |v| {
-                        if (v.len > 0) {
-                            try stdout_w.interface.print("info string SyzygyPath set \"{s}\" (probing not yet implemented)\n", .{v});
+                        const trimmed_v = std.mem.trim(u8, v, &std.ascii.whitespace);
+                        if (trimmed_v.len > 0) {
+                            try stdout_w.interface.print("info string SyzygyPath set \"{s}\" (probing not yet implemented)\n", .{trimmed_v});
                         } else {
                             try stdout_w.interface.print("info string SyzygyPath cleared (probing not yet implemented)\n", .{});
                         }
@@ -141,11 +131,10 @@ pub fn main(init: std.process.Init) !void {
                         try stdout_w.interface.print("info string SyzygyPath cleared (probing not yet implemented)\n", .{});
                     }
                     try stdout_w.interface.flush();
-                } else if (std.mem.eql(u8, opt.name, "Ponder") or std.mem.eql(u8, opt.name, "UCI_Chess960") or std.mem.eql(u8, opt.name, "MultiPV")) {
-                    try proto.events.publishInfoString(io, &stdout_w, "option ok");
                 } else {
-                    try stderr_w.interface.print("unknown option: {s}\n", .{opt.name});
-                    try stderr_w.interface.flush();
+                    var buf: [256]u8 = undefined;
+                    const msg = std.fmt.bufPrint(&buf, "{s} set", .{opt.name}) catch opt.name;
+                    try proto.events.publishInfoString(io, &stdout_w, msg);
                 }
             },
             .register => |reg| {
@@ -160,7 +149,7 @@ pub fn main(init: std.process.Init) !void {
             },
             .ucinewgame => {
                 session = proto.session.Session.init(core.Board.startingPosition());
-                tt.clear();
+                engine.newGame();
             },
             .quit => break,
             .stop => {
@@ -218,7 +207,7 @@ pub fn main(init: std.process.Init) !void {
                     continue;
                 }
                 var out: [6]core.bench.BenchResult = undefined;
-                const limits = core.search.SearchLimits{ .depth = depth, .threads = threads, .use_book = false };
+                const limits = core.search.SearchLimits{ .depth = depth, .threads = engine.config.threads, .use_book = false };
                 const n = core.bench.runSuiteWithIo(io, limits, &out);
                 var total_nodes: u64 = 0;
                 var total_qnodes: u64 = 0;
@@ -237,7 +226,7 @@ pub fn main(init: std.process.Init) !void {
                     total_ms += r.time_ms;
                 }
                 const total_nps: u64 = if (total_ms > 0) total_nodes * 1000 / total_ms else total_nodes;
-                try stdout_w.interface.print("info string bench total nodes {d} qnodes {d} cutoffs {d} time {d} nps {d} threads {d} hash {d}\n", .{ total_nodes, total_qnodes, total_cutoffs, total_ms, total_nps, threads, hash_mb });
+                try stdout_w.interface.print("info string bench total nodes {d} qnodes {d} cutoffs {d} time {d} nps {d} threads {d} hash {d}\n", .{ total_nodes, total_qnodes, total_cutoffs, total_ms, total_nps, engine.config.threads, engine.config.hash_mb });
                 try stdout_w.interface.flush();
             },
             .display => {
@@ -257,44 +246,57 @@ pub fn main(init: std.process.Init) !void {
                 try stdout_w.interface.flush();
             },
             .speedtest => |s| {
-                const thr = s.threads orelse threads;
-                const hmb = s.hash orelse hash_mb;
-                const secs = s.secs orelse 5;
-                if (s.threads == null and s.hash == null and s.secs == null) {
-                    // no args -> use current with 5s default (already)
+                const cur_threads = engine.config.threads;
+                const cur_hash = engine.config.hash_mb;
+                const thr_opt = s.threads;
+                const hmb_opt = s.hash;
+                const secs_opt = s.secs;
+                var thr: u8 = cur_threads;
+                var hmb: u32 = cur_hash;
+                var secs: u32 = 5;
+                if (thr_opt == null and hmb_opt == null and secs_opt == null) {
+                    // use defaults (current threads/hash, 5s)
                 } else {
-                    if (s.threads == null or s.hash == null or s.secs == null) {
+                    if (thr_opt == null or hmb_opt == null or secs_opt == null) {
                         try stdout_w.interface.print("info string error: speedtest requires <Threads 1..16> <Hash 1..1024> <Seconds 1..60>\n", .{});
                         try stdout_w.interface.flush();
                         continue;
                     }
-                }
-                if (thr < 1 or thr > 16) {
-                    try stdout_w.interface.print("info string error: speedtest Threads 1..16\n", .{});
-                    try stdout_w.interface.flush();
-                    continue;
-                }
-                if (hmb < 1 or hmb > 1024) {
-                    try stdout_w.interface.print("info string error: speedtest Hash 1..1024\n", .{});
-                    try stdout_w.interface.flush();
-                    continue;
-                }
-                if (secs < 1 or secs > 60) {
-                    try stdout_w.interface.print("info string error: speedtest Seconds 1..60\n", .{});
-                    try stdout_w.interface.flush();
-                    continue;
-                }
-                // Reallocate TT if hash changed for harness
-                if (hmb != hash_mb) {
-                    tt.deinit(tt_alloc);
-                    tt = proto.table.allocTT(tt_alloc, @as(usize, hmb) * 1024 * 1024) catch {
-                        try stdout_w.interface.print("info string error: speedtest Hash alloc failed\n", .{});
+                    thr = thr_opt.?;
+                    hmb = hmb_opt.?;
+                    secs = secs_opt.?;
+                    if (thr < 1 or thr > 16) {
+                        try stdout_w.interface.print("info string error: speedtest Threads 1..16\n", .{});
                         try stdout_w.interface.flush();
-                        tt = proto.table.allocTT(tt_alloc, @as(usize, hash_mb) * 1024 * 1024) catch {
-                            try stderr_w.interface.print("fatal: TT alloc failed\n", .{});
-                            try stderr_w.interface.flush();
-                            return;
-                        };
+                        continue;
+                    }
+                    if (hmb < 1 or hmb > 1024) {
+                        try stdout_w.interface.print("info string error: speedtest Hash 1..1024\n", .{});
+                        try stdout_w.interface.flush();
+                        continue;
+                    }
+                    if (secs < 1 or secs > 60) {
+                        try stdout_w.interface.print("info string error: speedtest Seconds 1..60\n", .{});
+                        try stdout_w.interface.flush();
+                        continue;
+                    }
+                    // Apply permanently through setOption path so config stays consistent
+                    var tbuf: [16]u8 = undefined;
+                    var hbuf: [16]u8 = undefined;
+                    const tstr = std.fmt.bufPrint(&tbuf, "{d}", .{thr}) catch "1";
+                    const hstr = std.fmt.bufPrint(&hbuf, "{d}", .{hmb}) catch "16";
+                    engine.setOption("Threads", tstr) catch {
+                        try stdout_w.interface.print("info string error: speedtest Threads invalid\n", .{});
+                        try stdout_w.interface.flush();
+                        continue;
+                    };
+                    engine.setOption("Hash", hstr) catch |err| {
+                        if (err == error.InvalidValue) {
+                            try stdout_w.interface.print("info string error: speedtest Hash invalid\n", .{});
+                        } else {
+                            try stdout_w.interface.print("info string error: speedtest Hash alloc failed\n", .{});
+                        }
+                        try stdout_w.interface.flush();
                         continue;
                     };
                 }
@@ -310,7 +312,7 @@ pub fn main(init: std.process.Init) !void {
                     if (elapsed_check >= @as(i96, deadline_ns)) break;
                     var dummy = std.atomic.Value(bool).init(false);
                     const tok = core.search.CancellationToken{ .cancelled = &dummy };
-                    const limits = core.search.SearchLimits{ .depth = 4, .threads = thr, .use_book = false };
+                    const limits = core.search.SearchLimits{ .depth = 4, .threads = engine.config.threads, .use_book = false };
                     const res = core.search.searchWithCancellation(board, limits, tok);
                     total_nodes += res.nodes;
                     total_qnodes += res.qnodes;
@@ -321,7 +323,7 @@ pub fn main(init: std.process.Init) !void {
                 const elapsed_ns: u64 = if (elapsed_ns_i96 > 0) @intCast(elapsed_ns_i96) else 1;
                 const elapsed_ms: u64 = @max(1, elapsed_ns / 1_000_000);
                 const nps: u64 = if (elapsed_ns > 0) total_nodes * 1_000_000_000 / elapsed_ns else total_nodes;
-                try stdout_w.interface.print("info string speedtest threads {d} hash {d} secs {d} iterations {d} nodes {d} qnodes {d} time {d} nps {d}\n", .{ thr, hmb, secs, iterations, total_nodes, total_qnodes, elapsed_ms, nps });
+                try stdout_w.interface.print("info string speedtest threads {d} hash {d} secs {d} iterations {d} nodes {d} qnodes {d} time {d} nps {d}\n", .{ engine.config.threads, engine.config.hash_mb, secs, iterations, total_nodes, total_qnodes, elapsed_ms, nps });
                 try stdout_w.interface.flush();
             },
             .go => |g| {
@@ -334,7 +336,8 @@ pub fn main(init: std.process.Init) !void {
 
                 var depth: u8 = 3;
                 const nodes = g.nodes;
-                const threads_use = threads;
+                const threads_use = engine.config.threads;
+                const use_book = engine.config.use_opening_book;
 
                 if (g.depth) |d| depth = d;
                 if (g.movetime) |ms| {
@@ -359,7 +362,7 @@ pub fn main(init: std.process.Init) !void {
                     depth = 4;
                 }
 
-                const limits = core.search.SearchLimits{ .depth = depth, .nodes = nodes, .threads = threads_use };
+                const limits = core.search.SearchLimits{ .depth = depth, .nodes = nodes, .threads = threads_use, .use_book = use_book };
                 var res = core.search.searchWithCancellation(session.board, limits, .{ .cancelled = &struct {
                     var dummy = std.atomic.Value(bool).init(false);
                 }.dummy });

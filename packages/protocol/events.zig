@@ -18,14 +18,23 @@ pub fn publishBestmove(io: std.Io, writer: *std.Io.File.Writer, uci: []const u8)
 pub fn publishId(io: std.Io, writer: *std.Io.File.Writer) !void {
     try writer.interface.print("id name bitwark 0.1.0\n", .{});
     try writer.interface.print("id author bitwark\n", .{});
-    try writer.interface.print("option name Threads type spin default 1 min 1 max 16\n", .{});
-    try writer.interface.print("option name Hash type spin default 16 min 1 max 1024\n", .{});
-    try writer.interface.print("option name MoveOverhead type spin default 30 min 0 max 5000\n", .{});
-    try writer.interface.print("option name Clear Hash type button\n", .{});
-    try writer.interface.print("option name SyzygyPath type string default <empty>\n", .{});
-    try writer.interface.print("option name Ponder type check default false\n", .{});
-    try writer.interface.print("option name UCI_Chess960 type check default false\n", .{});
-    try writer.interface.print("option name MultiPV type spin default 1 min 1 max 4\n", .{});
+    const core = @import("bitwark_core");
+    for (core.config.option_decls) |decl| {
+        switch (decl.opt_type) {
+            .spin => {
+                try writer.interface.print("option name {s} type spin default {s} min {d} max {d}\n", .{ decl.name, decl.default, decl.min.?, decl.max.? });
+            },
+            .check => {
+                try writer.interface.print("option name {s} type check default {s}\n", .{ decl.name, decl.default });
+            },
+            .string => {
+                try writer.interface.print("option name {s} type string default {s}\n", .{ decl.name, decl.default });
+            },
+            .button => {
+                try writer.interface.print("option name {s} type button\n", .{decl.name});
+            },
+        }
+    }
     try writer.interface.flush();
     _ = io;
 }
