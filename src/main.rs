@@ -21,11 +21,54 @@
 //!
 //! The runtime uses 2 worker threads: the session task awaits stdin, the
 //! writer task awaits the channel — both are idle 99.99% of the time.
+//!
+//! CLI vs UCI dispatch: `clap` parses OS-shell arguments *before* the tokio
+//! runtime is built. No args → UCI mode (the GUI path). `bench` and other
+//! subcommands are one-shot and exit without ever starting the UCI loop,
+//! mirroring `./stockfish bench` (UCI spec §5.1).
 
+mod cli;
 mod uci;
 
-#[tokio::main(worker_threads = 2)]
-async fn main() {
+use clap::Parser;
+use cli::{Cli, Commands};
+
+fn main() {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Some(Commands::Bench {
+            tt_size,
+            threads,
+            limit,
+            fen_file,
+            limit_type,
+        }) => {
+            // Phase 4 will wire this to the real search benchmark. For now
+            // we exit with a stub so `--help`/`bench --help` and the binary
+            // shape can be tested from Phase 0 onward.
+            eprintln!(
+                "bench: not yet implemented (Phase 4) — \
+                 got tt_size={tt_size} threads={threads} limit={limit} \
+                 fen_file={fen_file} limit_type={limit_type}"
+            );
+            std::process::exit(0);
+        }
+        None => {
+            // UCI mode — the normal GUI path. Build a small tokio runtime
+            // (2 workers: session + writer) and block on the session.
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("failed to build tokio runtime");
+            let code = rt.block_on(run_uci());
+            std::process::exit(code);
+        }
+    }
+}
+
+async fn run_uci() -> i32 {
     // Bounded channel: if the GUI stops reading our output, we block instead
     // of buffering without limit (back-pressure beats OOM).
     let (tx, rx) = tokio::sync::mpsc::channel::<String>(1024);
@@ -41,5 +84,5 @@ async fn main() {
     let _ = writer.await;
 
     // A stdin read error is the only failure mode here; treat it like `quit`.
-    std::process::exit(if result.is_ok() { 0 } else { 1 });
+    if result.is_ok() { 0 } else { 1 }
 }

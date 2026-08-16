@@ -4,14 +4,19 @@ version = "0.1.0"
 edition = "2024"
 description = "A classical chess engine: magic bitboards, handcrafted eval, alpha-beta search"
 
-# The single external dependency of the whole engine.
+# External dependencies — intentionally minimal.
 #
-# tokio is used ONLY for the UCI I/O layer (async stdin/stdout, channels,
-# timers). The chess core — board, move generation, search — is pure
-# synchronous CPU code with zero await points, so the async runtime never
-# touches the hot path.
+# * tokio — ONLY for the UCI I/O layer (async stdin/stdout, channels,
+#   timers). The chess core — board, move generation, search — is pure
+#   synchronous CPU code with zero await points, so the async runtime never
+#   touches the hot path.
+# * clap  — CLI argument parsing (`--help`/`--version` and subcommands like
+#   `bench`). The engine is launched without args by GUIs (pure UCI on
+#   stdin/stdout); `bench` is the one-shot CLI entry point that mirrors
+#   Stockfish's `./stockfish bench` (UCI spec §5.1).
 [dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "io-util", "io-std", "sync", "time"] }
+clap = { version = "4", features = ["derive"] }
 
 # Maximum-optimization release profile:
 # - lto = "fat":          cross-crate whole-program optimization
