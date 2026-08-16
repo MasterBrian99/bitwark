@@ -33,6 +33,7 @@
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
+use crate::board::{Position, parse_fen};
 use crate::uci::options::EngineOptions;
 use crate::uci::parse::{self, UciCommand};
 
@@ -54,7 +55,8 @@ pub struct UciSession {
     /// sent through the same channel.
     #[allow(dead_code)]
     debug: bool,
-    // Phase 1: the current `Position`, updated by `position ... moves ...`.
+    /// Current board position, updated by `position` commands.
+    position: Position,
     // Phase 3: a handle to the search thread + its control channel.
 }
 
@@ -64,6 +66,7 @@ impl UciSession {
             out,
             options: EngineOptions::default(),
             debug: false,
+            position: Position::startpos(),
         }
     }
 
@@ -87,12 +90,34 @@ impl UciSession {
                 UciCommand::SetOption { name, value } => {
                     self.options.set(&name, value.as_deref());
                 }
-                // Everything below is parsed and accepted but inert until
-                // its phase lands . Replying nothing to
-                // `position`/`ucinewgame`/`setoption` is always legal; `go`
-                // becomes real in Phase 3.
+                // `position` — update the current board (Phase 1). Moves tail is
+                // accepted but deferred to Phase 2; we hint via `info string`
+                // so manual testing is not silently confusing.
+                UciCommand::Position { fen, moves } => {
+                    let new_pos = match fen {
+                        None => Position::startpos(),
+                        Some(s) => match parse_fen(&s) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                self.send(&format!("info string error: {e}")).await;
+                                continue;
+                            }
+                        },
+                    };
+                    if !moves.is_empty() {
+                        self.send("info string position moves ignored (Phase 2)")
+                            .await;
+                    }
+                    self.position = new_pos;
+                }
+                UciCommand::D => {
+                    for line in self.position.display_lines() {
+                        self.send(&line).await;
+                    }
+                }
+                // Everything below is inert until its phase lands .
+                // Replying nothing is always legal; `go` becomes real in Phase 3.
                 UciCommand::UciNewGame
-                | UciCommand::Position { .. }
                 | UciCommand::Go(_)
                 | UciCommand::Stop
                 | UciCommand::PonderHit

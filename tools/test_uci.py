@@ -108,13 +108,27 @@ async def test_setoption(eng: UciEngine) -> None:
 
 
 async def test_position_accepted(eng: UciEngine) -> None:
+    # Valid positions without move tail must be silent.
     await eng.send("position startpos")
-    await eng.send("position startpos moves e2e4 e7e5")
+    got = await eng.read_silence(0.2)
+    check(not got, f"position startpos should be silent: {got}")
+
     start_fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
     await eng.send(f"position fen {start_fen}")
+    got = await eng.read_silence(0.2)
+    check(not got, f"valid fen without moves should be silent: {got}")
+
+    # With a move tail the engine hints that moves are deferred to Pass 2.
+    await eng.send("position startpos moves e2e4 e7e5")
+    got = await eng.read_silence(0.2)
+    check(any("moves ignored" in l for l in got), f"position with moves should hint ignored: {got}")
+
+    # Invalid FEN must not crash — engine replies with `info string` and stays alive.
     await eng.send("position fen 8/8/8/8/8/8/8/8 w - - 0 1 moves a1a2")
     got = await eng.read_silence(0.2)
-    check(not got, f"position must be silent for now (board arrives in Pass 1): {got}")
+    check(any("error" in l.lower() for l in got), f"invalid fen should give error: {got}")
+    lines = await eng.isready()
+    check(lines[-1] == "readyok", f"engine unresponsive after invalid fen: {lines}")
 
 
 async def test_ucinewgame(eng: UciEngine) -> None:

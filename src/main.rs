@@ -27,6 +27,7 @@
 //! subcommands are one-shot and exit without ever starting the UCI loop,
 //! mirroring `./stockfish bench` (UCI spec §5.1).
 
+mod board;
 mod cli;
 mod uci;
 

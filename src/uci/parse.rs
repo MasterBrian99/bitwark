@@ -98,6 +98,8 @@ pub enum UciCommand {
     Quit,
     /// `register ...` — accepted and ignored (no registration scheme).
     Register,
+    /// `d` — pretty-print the current position (UCI spec §5.3, Stockfish `d`).
+    D,
     /// Anything unrecognized, malformed, or empty. Per the protocol these
     /// must be silently ignored so the engine stays forward-compatible with
     /// GUIs speaking newer UCI dialects.
@@ -120,6 +122,7 @@ pub fn parse_line(line: &str) -> UciCommand {
         "ponderhit" => UciCommand::PonderHit,
         "quit" => UciCommand::Quit,
         "register" => UciCommand::Register,
+        "d" => UciCommand::D,
         "debug" => match rest.first() {
             Some(&"on") => UciCommand::Debug(true),
             Some(&"off") => UciCommand::Debug(false),
