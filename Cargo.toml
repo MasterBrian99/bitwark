@@ -1,0 +1,27 @@
+[package]
+name = "bitwark"
+version = "0.1.0"
+edition = "2024"
+description = "A classical chess engine: magic bitboards, handcrafted eval, alpha-beta search"
+
+# The single external dependency of the whole engine.
+#
+# tokio is used ONLY for the UCI I/O layer (async stdin/stdout, channels,
+# timers). The chess core — board, move generation, search — is pure
+# synchronous CPU code with zero await points, so the async runtime never
+# touches the hot path.
+[dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "io-util", "io-std", "sync", "time"] }
+
+# Maximum-optimization release profile:
+# - lto = "fat":          cross-crate whole-program optimization
+# - codegen-units = 1:    one LLVM codegen unit -> better scheduling
+# - panic = "abort":      no unwinding tables -> smaller & faster
+# - strip = true:         strip symbols
+#
+# Note: `cargo test` uses the dev profile, so tests still run with unwinding.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

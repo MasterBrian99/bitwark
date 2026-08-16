@@ -1,0 +1,11 @@
+# Local build flags.
+#
+# target-cpu=native lets the compiler use every instruction the *build*
+# machine supports (AVX2/BMI2/POPCNT...). The magic-bitboard move generator
+# in particular benefits hugely from BMI2's PEXT instruction where available.
+#
+# Trade-off: the binary then only runs on this CPU family. For a distributed
+# build, build with `RUSTFLAGS="" cargo build --release` override or remove
+# this file.
+[build]
+rustflags = ["-C", "target-cpu=native"]
