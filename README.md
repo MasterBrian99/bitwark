@@ -1,3 +1,0 @@
-# Bitwark
-
-chess engine
