@@ -256,6 +256,138 @@ pub fn generate_pseudo_legal(pos: &Position, moves: &mut Vec<Move>) {
     }
 }
 
+/// Generate pseudo-legal captures and promotions (for quiescence).
+///
+/// Includes:
+///
+/// - pawn captures (including en passant)
+/// - pawn promotion pushes (quiet promotions to Q/R/B/N)
+/// - all piece captures (knight/bishop/rook/queen/king x opponent piece)
+///
+/// Castling and quiet pawn pushes are excluded.
+pub fn generate_pseudo_captures(pos: &Position, moves: &mut Vec<Move>) {
+    let us = pos.side_to_move();
+    let them = us.opposite();
+    let occupied = pos.occupied();
+    let them_occ = pos.occupied_color(them);
+
+    // Pawns — captures + promotion pushes
+    let pawns = pos.pieces_bb(Piece::new(us, PieceType::Pawn));
+    for from in pawns.squares() {
+        let dir: i8 = if us == Color::White { 1 } else { -1 };
+        let r = from.rank() as i8;
+        let f = from.file() as i8;
+        let promo_rank = if us == Color::White { 7 } else { 0 };
+
+        // Captures (including promotions and en passant)
+        for df in [-1, 1] {
+            let nf = f + df;
+            let nr = r + dir;
+            if !(0..8).contains(&nr) || !(0..8).contains(&nf) {
+                continue;
+            }
+            let to = Square::from_coords(nf as u8, nr as u8);
+            let target = pos.piece_at(to);
+            let is_capture = target.is_some() && target.unwrap().color() == them;
+            let is_ep = pos.en_passant() == Some(to) && target.is_none();
+            if is_capture || is_ep {
+                if nr as u8 == promo_rank {
+                    for promo in [
+                        PieceType::Queen,
+                        PieceType::Rook,
+                        PieceType::Bishop,
+                        PieceType::Knight,
+                    ] {
+                        moves.push(Move::new(from, to, Some(promo)));
+                    }
+                } else {
+                    moves.push(Move::new(from, to, None));
+                }
+            }
+        }
+
+        // Promotion pushes (quiet, no capture)
+        let nr = r + dir;
+        if (0..8).contains(&nr) && nr as u8 == promo_rank {
+            let to = Square::from_coords(f as u8, nr as u8);
+            if pos.piece_at(to).is_none() {
+                for promo in [
+                    PieceType::Queen,
+                    PieceType::Rook,
+                    PieceType::Bishop,
+                    PieceType::Knight,
+                ] {
+                    moves.push(Move::new(from, to, Some(promo)));
+                }
+            }
+        }
+    }
+
+    let us_occ = pos.occupied_color(us);
+    let empty_or_them = !us_occ;
+
+    // Knights
+    let knights = pos.pieces_bb(Piece::new(us, PieceType::Knight));
+    for from in knights.squares() {
+        let attacks = knight_attacks(from) & them_occ;
+        for to in attacks.squares() {
+            moves.push(Move::new(from, to, None));
+        }
+    }
+    // Bishops
+    let bishops = pos.pieces_bb(Piece::new(us, PieceType::Bishop));
+    for from in bishops.squares() {
+        let attacks = bishop_attacks(from, occupied) & them_occ;
+        for to in attacks.squares() {
+            moves.push(Move::new(from, to, None));
+        }
+    }
+    // Rooks
+    let rooks = pos.pieces_bb(Piece::new(us, PieceType::Rook));
+    for from in rooks.squares() {
+        let attacks = rook_attacks(from, occupied) & them_occ;
+        for to in attacks.squares() {
+            moves.push(Move::new(from, to, None));
+        }
+    }
+    // Queens
+    let queens = pos.pieces_bb(Piece::new(us, PieceType::Queen));
+    for from in queens.squares() {
+        let attacks = queen_attacks(from, occupied) & them_occ;
+        for to in attacks.squares() {
+            moves.push(Move::new(from, to, None));
+        }
+    }
+    // King captures (rare in quiescence but included for correctness)
+    let kings = pos.pieces_bb(Piece::new(us, PieceType::King));
+    for from in kings.squares() {
+        let attacks = king_attacks(from) & them_occ;
+        for to in attacks.squares() {
+            moves.push(Move::new(from, to, None));
+        }
+    }
+}
+
+/// Generate legal captures and promotions (pseudo-captures filtered for king safety).
+pub fn generate_captures(pos: &mut Position, moves: &mut Vec<Move>) {
+    let mut pseudo = Vec::new();
+    generate_pseudo_captures(pos, &mut pseudo);
+    let us = pos.side_to_move();
+    for mv in pseudo {
+        pos.make_move(mv);
+        let king_sq = pos.king_square(us);
+        let in_check = if let Some(ksq) = king_sq {
+            is_square_attacked(pos, ksq, us.opposite())
+        } else {
+            true
+        };
+        pos.unmake_move(mv);
+        if !in_check {
+            moves.push(mv);
+        }
+    }
+}
+
 /// Generate all legal moves (filters pseudo-legal that leave king in check).
 pub fn generate_legal(pos: &mut Position, moves: &mut Vec<Move>) {
     let mut pseudo = Vec::new();

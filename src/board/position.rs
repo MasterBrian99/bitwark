@@ -589,6 +589,44 @@ impl Position {
     }
 
     // -----------------------------------------------------------------------
+    // Draw detection helpers
+    // -----------------------------------------------------------------------
+
+    /// Two-fold repetition: current hash equals any previous position's hash
+    /// within the reversible window (bounded by `halfmove`).  Treats the first
+    /// repetition as a draw inside search.
+    pub fn is_repetition(&self) -> bool {
+        let cur = self.hash;
+        // Only positions since the last pawn move / capture can possibly repeat.
+        // `halfmove` counts reversible plies since then.
+        let hm = self.halfmove as usize;
+        if hm == 0 || self.history.is_empty() {
+            return false;
+        }
+        // Number of history entries that could match — limited by halfmove.
+        let window = hm.min(self.history.len());
+        let start = self.history.len() - window;
+        for i in start..self.history.len() {
+            if self.history[i].hash == cur {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 50-move rule: 100 half-moves without pawn move or capture.
+    #[inline]
+    pub fn is_fifty_move_draw(&self) -> bool {
+        self.halfmove >= 100
+    }
+
+    /// True if the position is a draw by repetition or 50-move.
+    #[inline]
+    pub fn is_draw(&self) -> bool {
+        self.is_fifty_move_draw() || self.is_repetition()
+    }
+
+    // -----------------------------------------------------------------------
     // Internal helpers for `fen.rs` (crate-private)
     // -----------------------------------------------------------------------
 

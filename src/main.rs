@@ -29,6 +29,8 @@
 
 mod board;
 mod cli;
+mod eval;
+mod search;
 mod uci;
 
 use clap::Parser;

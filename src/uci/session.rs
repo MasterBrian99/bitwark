@@ -33,7 +33,13 @@
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
-use crate::board::{Move, Position, parse_fen};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
+use crate::board::{Color, Move, Position, parse_fen};
+use crate::search::{MATE, MAX_PLY, SearchLimits};
 use crate::uci::options::EngineOptions;
 use crate::uci::parse::{self, UciCommand};
 
@@ -42,6 +48,12 @@ pub const ENGINE_NAME: &str = concat!("Bitwark ", env!("CARGO_PKG_VERSION"));
 
 /// Reported by `id author`.
 pub const ENGINE_AUTHOR: &str = "Brian";
+
+/// Handle to the running search thread.
+struct SearchHandle {
+    thread: std::thread::JoinHandle<()>,
+    stop: Arc<AtomicBool>,
+}
 
 /// Live protocol state for one engine process.
 pub struct UciSession {
@@ -57,7 +69,8 @@ pub struct UciSession {
     debug: bool,
     /// Current board position, updated by `position` commands.
     position: Position,
-    // Phase 3: a handle to the search thread + its control channel.
+    /// Running search, if any.
+    search: Option<SearchHandle>,
 }
 
 impl UciSession {
@@ -67,6 +80,27 @@ impl UciSession {
             options: EngineOptions::default(),
             debug: false,
             position: Position::startpos(),
+            search: None,
+        }
+    }
+
+    /// True if a search is currently running.
+    fn search_running(&self) -> bool {
+        if let Some(h) = &self.search {
+            !h.thread.is_finished()
+        } else {
+            false
+        }
+    }
+
+    /// Reap a finished search handle (join the thread).  Call before spawning
+    /// a new search or on quit.
+    fn reap_search_if_finished(&mut self) {
+        if let Some(h) = &self.search
+            && h.thread.is_finished()
+        {
+            let h = self.search.take().unwrap();
+            let _ = h.thread.join();
         }
     }
 
@@ -83,7 +117,13 @@ impl UciSession {
                 None => return Ok(()),
             };
             match parse::parse_line(&line) {
-                UciCommand::Quit => return Ok(()),
+                UciCommand::Quit => {
+                    // Signal any running search to stop before exiting.
+                    if let Some(h) = &self.search {
+                        h.stop.store(true, Ordering::Relaxed);
+                    }
+                    return Ok(());
+                }
                 UciCommand::Uci => self.handle_uci().await,
                 UciCommand::IsReady => self.send("readyok").await,
                 UciCommand::Debug(on) => self.debug = on,
@@ -145,19 +185,166 @@ impl UciSession {
                         }
                         self.send(&format!("Nodes searched: {total}")).await;
                     } else {
-                        // Phase 3 search will handle non-perft `go`.
-                        self.send("info string go: search not yet implemented (Phase 3)")
-                            .await;
+                        self.handle_go(params).await;
                     }
                 }
-                // Everything below is inert until its phase lands.
-                UciCommand::UciNewGame
-                | UciCommand::Stop
-                | UciCommand::PonderHit
-                | UciCommand::Register
-                | UciCommand::Unknown => {}
+                UciCommand::Stop => {
+                    if let Some(h) = &self.search {
+                        h.stop.store(true, Ordering::Relaxed);
+                    }
+                }
+                UciCommand::PonderHit => {
+                    // Pondering not yet implemented (Phase 6) — treat like stop
+                    // for correctness: if pondering, stop the ponder search and
+                    // the GUI should send a real `go` afterwards.  For now just
+                    // signal stop if a search is running.
+                    if let Some(h) = &self.search {
+                        h.stop.store(true, Ordering::Relaxed);
+                    }
+                }
+                UciCommand::UciNewGame => {
+                    // No TT yet (Phase 4); just reap finished search if any.
+                    self.reap_search_if_finished();
+                }
+                UciCommand::Register | UciCommand::Unknown => {}
             }
         }
+    }
+
+    /// Handle a non-perft `go` — spawn the sync search thread.
+    async fn handle_go(&mut self, params: crate::uci::parse::GoParams) {
+        // If a search is already running, reject this one (GUIs shouldn't do it).
+        if self.search_running() {
+            self.send("info string error: search already running").await;
+            return;
+        }
+        // Reap any finished handle before spawning.
+        self.reap_search_if_finished();
+
+        // Warn about unsupported limits (Phase 6 will handle them).
+        if !params.searchmoves.is_empty() {
+            self.send("info string searchmoves not yet supported (Phase 6)")
+                .await;
+        }
+        if params.mate.is_some() {
+            self.send("info string mate limit not yet supported (Phase 6)")
+                .await;
+        }
+        if params.nodes.is_some() {
+            self.send("info string nodes limit not yet supported (Phase 6)")
+                .await;
+        }
+        if params.ponder {
+            self.send("info string ponder not yet supported (Phase 6)")
+                .await;
+        }
+
+        // Build limits.
+        let depth = params.depth;
+        let mut movetime_ms = params.movetime;
+        let infinite = params.infinite || params.ponder;
+
+        // Minimal clock fallback for time controls (Phase 6 is full management).
+        if depth.is_none() && movetime_ms.is_none() && !infinite {
+            let time_opt = match self.position.side_to_move() {
+                Color::White => params.wtime,
+                Color::Black => params.btime,
+            };
+            let inc_opt = match self.position.side_to_move() {
+                Color::White => params.winc,
+                Color::Black => params.binc,
+            };
+            if let Some(time) = time_opt {
+                let inc = inc_opt.unwrap_or(0);
+                let base = if let Some(mtg) = params.movestogo {
+                    if mtg > 0 {
+                        time / mtg as u64
+                    } else {
+                        time / 20
+                    }
+                } else {
+                    time / 20
+                };
+                let mt = base + inc * 3 / 4;
+                let overhead = 10u64;
+                let clamped = mt.clamp(10, time.saturating_sub(overhead).max(10));
+                movetime_ms = Some(clamped);
+            }
+        }
+
+        let limits = SearchLimits {
+            depth,
+            movetime_ms,
+            infinite,
+        };
+
+        // Spawn the search thread.
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = Arc::clone(&stop);
+        let pos_clone = self.position.clone();
+        let out_clone = self.out.clone();
+
+        let thread = std::thread::spawn(move || {
+            let mut pos = pos_clone;
+            let limits = limits;
+            let stop = stop_clone;
+            let out = out_clone;
+
+            let result = crate::search::search(&mut pos, limits, &stop, &mut |event| {
+                let score_str = if event.score.abs() >= MATE - MAX_PLY as i32 {
+                    let mate_in = if event.score > 0 {
+                        (MATE - event.score + 1) / 2
+                    } else {
+                        -((MATE + event.score + 1) / 2)
+                    };
+                    format!("mate {mate_in}")
+                } else {
+                    format!("cp {}", event.score)
+                };
+                let pv_str = event
+                    .pv
+                    .iter()
+                    .map(|m| m.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let line = if pv_str.is_empty() {
+                    format!(
+                        "info depth {} seldepth {} score {} nodes {} nps {} time {}",
+                        event.depth,
+                        event.seldepth,
+                        score_str,
+                        event.nodes,
+                        event.nps,
+                        event.time_ms
+                    )
+                } else {
+                    format!(
+                        "info depth {} seldepth {} score {} nodes {} nps {} time {} pv {}",
+                        event.depth,
+                        event.seldepth,
+                        score_str,
+                        event.nodes,
+                        event.nps,
+                        event.time_ms,
+                        pv_str
+                    )
+                };
+                let _ = out.blocking_send(line);
+            });
+
+            let best_line = if let Some(mv) = result.best_move {
+                if result.pv.len() >= 2 {
+                    format!("bestmove {} ponder {}", mv, result.pv[1])
+                } else {
+                    format!("bestmove {}", mv)
+                }
+            } else {
+                "bestmove (none)".to_string()
+            };
+            let _ = out.blocking_send(best_line);
+        });
+
+        self.search = Some(SearchHandle { thread, stop });
     }
 
     /// Push one line toward stdout via the writer task.
