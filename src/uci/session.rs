@@ -33,7 +33,7 @@
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
-use crate::board::{Position, parse_fen};
+use crate::board::{Move, Position, parse_fen};
 use crate::uci::options::EngineOptions;
 use crate::uci::parse::{self, UciCommand};
 
@@ -90,11 +90,9 @@ impl UciSession {
                 UciCommand::SetOption { name, value } => {
                     self.options.set(&name, value.as_deref());
                 }
-                // `position` — update the current board (Phase 1). Moves tail is
-                // accepted but deferred to Phase 2; we hint via `info string`
-                // so manual testing is not silently confusing.
+                // `position` — update the current board, applying the `moves` tail.
                 UciCommand::Position { fen, moves } => {
-                    let new_pos = match fen {
+                    let mut new_pos = match fen {
                         None => Position::startpos(),
                         Some(s) => match parse_fen(&s) {
                             Ok(p) => p,
@@ -104,21 +102,56 @@ impl UciSession {
                             }
                         },
                     };
-                    if !moves.is_empty() {
-                        self.send("info string position moves ignored (Phase 2)")
-                            .await;
+                    let mut ok = true;
+                    for mv_str in moves {
+                        let mv = match Move::parse_uci(&mv_str) {
+                            Some(m) => m,
+                            None => {
+                                self.send(&format!("info string error: illegal move {mv_str}"))
+                                    .await;
+                                ok = false;
+                                break;
+                            }
+                        };
+                        // Verify legality via generate_legal (pseudo + king safety).
+                        let mut legal = Vec::new();
+                        crate::board::generate_legal(&mut new_pos, &mut legal);
+                        if !legal.contains(&mv) {
+                            self.send(&format!("info string error: illegal move {mv_str}"))
+                                .await;
+                            ok = false;
+                            break;
+                        }
+                        new_pos.make_move(mv);
                     }
-                    self.position = new_pos;
+                    if ok {
+                        self.position = new_pos;
+                    }
                 }
                 UciCommand::D => {
                     for line in self.position.display_lines() {
                         self.send(&line).await;
                     }
                 }
-                // Everything below is inert until its phase lands .
-                // Replying nothing is always legal; `go` becomes real in Phase 3.
+                UciCommand::Go(params) => {
+                    if let Some(depth) = params.perft {
+                        // Stockfish-like perft: per-move counts + total.
+                        let divide =
+                            crate::board::perft::perft_divide(&mut self.position.clone(), depth);
+                        let mut total = 0u64;
+                        for (mv, nodes) in divide {
+                            self.send(&format!("{mv}: {nodes}")).await;
+                            total += nodes;
+                        }
+                        self.send(&format!("Nodes searched: {total}")).await;
+                    } else {
+                        // Phase 3 search will handle non-perft `go`.
+                        self.send("info string go: search not yet implemented (Phase 3)")
+                            .await;
+                    }
+                }
+                // Everything below is inert until its phase lands.
                 UciCommand::UciNewGame
-                | UciCommand::Go(_)
                 | UciCommand::Stop
                 | UciCommand::PonderHit
                 | UciCommand::Register

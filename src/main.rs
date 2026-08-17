@@ -38,6 +38,46 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
+        Some(Commands::Perft { depth, fen }) => {
+            let mut pos = if fen == "startpos" {
+                crate::board::Position::startpos()
+            } else {
+                match crate::board::parse_fen(&fen) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("invalid fen: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            };
+            let start = std::time::Instant::now();
+            // For CLI perft we print divide like Stockfish
+            let divide = crate::board::perft::perft_divide(&mut pos.clone(), depth);
+            let total = if divide.is_empty() {
+                let n = crate::board::perft(&mut pos, depth);
+                println!("\nNodes searched: {n}");
+                n
+            } else {
+                let mut tot = 0u64;
+                for (mv, nodes) in divide {
+                    println!("{mv}: {nodes}");
+                    tot += nodes;
+                }
+                println!("\nNodes searched: {tot}");
+                tot
+            };
+            let elapsed = start.elapsed();
+            eprintln!(
+                "Time: {} ms ({} nps)",
+                elapsed.as_millis(),
+                if elapsed.as_millis() > 0 {
+                    total * 1000 / elapsed.as_millis() as u64
+                } else {
+                    total
+                }
+            );
+            std::process::exit(0);
+        }
         Some(Commands::Bench {
             tt_size,
             threads,

@@ -118,10 +118,17 @@ async def test_position_accepted(eng: UciEngine) -> None:
     got = await eng.read_silence(0.2)
     check(not got, f"valid fen without moves should be silent: {got}")
 
-    # With a move tail the engine hints that moves are deferred to Pass 2.
+    # With a legal move tail the engine applies the moves silently.
     await eng.send("position startpos moves e2e4 e7e5")
     got = await eng.read_silence(0.2)
-    check(any("moves ignored" in l for l in got), f"position with moves should hint ignored: {got}")
+    check(not got, f"legal moves tail should be silent: {got}")
+    # Verify via d that the position was updated (pawn on e4)
+    await eng.send("d")
+    lines = await eng.read_until(lambda l: l.startswith("Fen:"), timeout=1.0)
+    fen_line = next((l for l in lines if l.startswith("Fen:")), "")
+    check("4P3" in fen_line or "e4" in fen_line or "rnbqkbnr/pppp1ppp/8/4p3/4P3" in fen_line, f"d after moves should show e4 pawn: {fen_line}")
+    # Drain Checkers line
+    await eng.read_until(lambda l: l.startswith("Checkers:"), timeout=1.0)
 
     # Invalid FEN must not crash — engine replies with `info string` and stays alive.
     await eng.send("position fen 8/8/8/8/8/8/8/8 w - - 0 1 moves a1a2")

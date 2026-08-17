@@ -29,6 +29,19 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
+    /// Run perft (move generation correctness test) on a position.
+    ///
+    /// Example: `bitwark perft 5` (startpos depth 5) or
+    /// `bitwark perft 4 --fen "r3k2r/... w KQkq - 0 1"`
+    Perft {
+        /// Depth to search (1..255)
+        depth: u8,
+
+        /// FEN string (use quotes) or "startpos" (default)
+        #[arg(long, default_value = "startpos")]
+        fen: String,
+    },
+
     /// Run a fixed benchmark suite and report nodes/second.
     ///
     /// Mirrors Stockfish's `bench` (UCI spec §5.1). With no arguments the
