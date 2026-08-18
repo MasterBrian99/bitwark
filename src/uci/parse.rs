@@ -100,6 +100,10 @@ pub enum UciCommand {
     Register,
     /// `d` — pretty-print the current position (UCI spec §5.3, Stockfish `d`).
     D,
+    /// `eval` — static evaluation breakdown (UCI spec §5.4, debug command).
+    Eval,
+    /// `flip` — flip side to move (UCI spec §5.7, debug command).
+    Flip,
     /// Anything unrecognized, malformed, or empty. Per the protocol these
     /// must be silently ignored so the engine stays forward-compatible with
     /// GUIs speaking newer UCI dialects.
@@ -123,6 +127,8 @@ pub fn parse_line(line: &str) -> UciCommand {
         "quit" => UciCommand::Quit,
         "register" => UciCommand::Register,
         "d" => UciCommand::D,
+        "eval" => UciCommand::Eval,
+        "flip" => UciCommand::Flip,
         "debug" => match rest.first() {
             Some(&"on") => UciCommand::Debug(true),
             Some(&"off") => UciCommand::Debug(false),

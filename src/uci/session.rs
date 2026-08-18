@@ -195,6 +195,40 @@ impl UciSession {
                         self.send(&line).await;
                     }
                 }
+                UciCommand::Eval => {
+                    let bd = crate::eval::breakdown(&self.position);
+                    let phase = bd.phase;
+                    self.send("Eval breakdown (white perspective):").await;
+                    self.send(&format!(" Phase: {phase}/24")).await;
+                    self.send("  Term     |    MG    EG  |  Total").await;
+                    self.send("-----------+-------------+--------").await;
+                    for i in 0..crate::eval::TERM_COUNT {
+                        let mg = bd.term_mg[i];
+                        let eg = bd.term_eg[i];
+                        let total = (mg * phase + eg * (24 - phase)) / 24;
+                        let name = crate::eval::TERM_NAMES[i];
+                        self.send(&format!(" {name:9} | {mg:5} {eg:5} | {total:5}"))
+                            .await;
+                    }
+                    let total_mg = bd.mg();
+                    let total_eg = bd.eg();
+                    let total = bd.white_score();
+                    self.send("-----------+-------------+--------").await;
+                    self.send(&format!(
+                        " Total    | {total_mg:5} {total_eg:5} | {total:5}"
+                    ))
+                    .await;
+                    let total_cp = total as f32 / 100.0;
+                    self.send(&format!("Total evaluation: {total_cp:.2} (white side)"))
+                        .await;
+                    let stm = crate::eval::evaluate(&self.position);
+                    let stm_cp = stm as f32 / 100.0;
+                    self.send(&format!("Total evaluation (side to move): {stm_cp:.2}"))
+                        .await;
+                }
+                UciCommand::Flip => {
+                    self.position.flip_side_to_move();
+                }
                 UciCommand::Go(params) => {
                     if let Some(depth) = params.perft {
                         // Stockfish-like perft: per-move counts + total.

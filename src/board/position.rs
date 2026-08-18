@@ -695,6 +695,24 @@ impl Position {
         self.castling = undo.castling;
     }
 
+    /// Flip side to move without touching history (debug `flip` command, UCI spec §5.7).
+    ///
+    /// Clears en passant (XORing its file key if set) and XORs the side key,
+    /// mirroring `make_null_move`'s hashing but without pushing an undo record
+    /// or bumping halfmove/fullmove (a debug flip is not a ply).
+    pub fn flip_side_to_move(&mut self) {
+        let old_ep = self.en_passant;
+        let keys = zobrist::keys();
+        let mut new_hash = self.hash;
+        new_hash ^= keys.side;
+        if let Some(ep) = old_ep {
+            new_hash ^= keys.en_passant[ep.file() as usize];
+        }
+        self.hash = new_hash;
+        self.en_passant = None;
+        self.side_to_move = self.side_to_move.opposite();
+    }
+
     // -----------------------------------------------------------------------
     // Internal helpers for `fen.rs` (crate-private)
     // -----------------------------------------------------------------------
