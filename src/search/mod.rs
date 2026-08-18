@@ -21,6 +21,7 @@ use crate::board::{Move, Position, generate_legal, is_square_attacked};
 pub mod alpha_beta;
 pub mod order;
 pub mod quiescence;
+pub mod tt;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -107,10 +108,23 @@ pub struct SearchContext<'a> {
     pub stop: &'a AtomicBool,
     pub start: Instant,
     pub limits: SearchLimits,
+    /// Shared TT (SMP-ready, lock-free).
+    pub tt: std::sync::Arc<tt::TranspositionTable>,
+    /// Killers: two quiet moves per ply that caused a beta cutoff.
+    #[allow(dead_code)]
+    pub killers: [[Option<Move>; 2]; MAX_PLY],
+    /// History: side × from × to, gravity with cap ±16384.
+    #[allow(dead_code)]
+    pub history: Box<[[[i32; 64]; 64]; 2]>,
 }
 
 impl<'a> SearchContext<'a> {
-    pub fn new(stop: &'a AtomicBool, limits: SearchLimits, start: Instant) -> Self {
+    pub fn new(
+        stop: &'a AtomicBool,
+        limits: SearchLimits,
+        start: Instant,
+        tt: std::sync::Arc<tt::TranspositionTable>,
+    ) -> Self {
         Self {
             nodes: 0,
             seldepth: 0,
@@ -119,6 +133,9 @@ impl<'a> SearchContext<'a> {
             stop,
             start,
             limits,
+            tt,
+            killers: [[None; 2]; MAX_PLY],
+            history: Box::new([[[0; 64]; 64]; 2]),
         }
     }
 
@@ -146,11 +163,13 @@ pub fn search(
     pos: &mut Position,
     limits: SearchLimits,
     stop: &AtomicBool,
+    tt: &std::sync::Arc<tt::TranspositionTable>,
     on_event: &mut dyn FnMut(SearchEvent),
 ) -> SearchResult {
     let start = Instant::now();
     let max_depth = limits.max_depth();
-    let mut ctx = SearchContext::new(stop, limits.clone(), start);
+    tt.new_search();
+    let mut ctx = SearchContext::new(stop, limits.clone(), start, std::sync::Arc::clone(tt));
 
     // Root legal moves — if none, return immediately (mate/stalemate).
     let mut root_moves = Vec::new();
@@ -177,10 +196,10 @@ pub fn search(
     let mut best_move = root_moves[0];
     let mut best_score: i32 = 0;
     let mut best_pv: Vec<Move> = vec![best_move];
+    let mut prev_score: i32 = 0;
 
-    // Iterative deepening.
+    // Iterative deepening with aspiration windows.
     for depth in 1..=max_depth {
-        // Stop before starting a new iteration if limit hit.
         if stop.load(Ordering::Relaxed) {
             break;
         }
@@ -189,19 +208,59 @@ pub fn search(
             break;
         }
 
-        // Search this depth from the root.
-        // We do a full root loop rather than calling alpha_beta directly so we
-        // can handle move ordering (previous best first) and early abort.
-        let iteration_best = root_search(pos, depth as i32, &mut ctx);
+        // Aspiration window (depth >=5 and not a mate score).
+        let mut delta: i32 = 25;
+        let mut alpha = -VALUE_INFINITE;
+        let mut beta = VALUE_INFINITE;
+        if depth >= 5 && prev_score.abs() < MATE - MAX_PLY as i32 {
+            alpha = prev_score - delta;
+            beta = prev_score + delta;
+        }
 
-        // If the iteration was aborted (stop flag set mid-iteration), keep the
-        // previous completed iteration's result.
+        let mut iteration_best: Option<(Move, i32)> = None;
+        // Aspiration re-search loop.
+        loop {
+            let res = root_search(pos, depth as i32, alpha, beta, &mut ctx);
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            let Some((mv, score)) = res else {
+                break;
+            };
+            if score <= alpha {
+                // Fail low — widen window downward.
+                beta = (alpha + beta) / 2;
+                alpha -= delta;
+                delta += delta / 2;
+                if delta > 500 {
+                    alpha = -VALUE_INFINITE;
+                    beta = VALUE_INFINITE;
+                }
+                // Don't emit; try again at same depth with wider window.
+                continue;
+            } else if score >= beta {
+                // Fail high — widen upward.
+                beta += delta;
+                delta += delta / 2;
+                if delta > 500 {
+                    alpha = -VALUE_INFINITE;
+                    beta = VALUE_INFINITE;
+                }
+                continue;
+            } else {
+                // Exact — inside window.
+                iteration_best = Some((mv, score));
+                prev_score = score;
+                break;
+            }
+        }
+
         if stop.load(Ordering::Relaxed) {
             break;
         }
-
         let Some((mv, score)) = iteration_best else {
-            break;
+            // Aspiration loop aborted or no result (stop) — keep previous best.
+            continue;
         };
 
         // Build PV for this iteration.
@@ -212,7 +271,6 @@ pub fn search(
                 pv.push(m);
             }
         }
-        // Fallback: if PV is empty (should not happen after a PV raise), use best move.
         if pv.is_empty() {
             pv.push(mv);
         }
@@ -240,15 +298,7 @@ pub fn search(
         };
         on_event(event);
 
-        // If we found a forced mate, we can stop early — but only if the
-        // announced mate fits within this depth.  Simpler to keep searching
-        // until limit; the extra depths are cheap when mate is near.
-        // We do stop if the mate is already very close (within 2 plies of
-        // announced distance): not necessary for Phase 3 correctness.
-        let _ = best_score; // suppress unused warning when not early-stopping
-
-        // Depth limit reached — `for` will exit anyway.
-        // Time limit: already checked at top of loop and inside recursion.
+        let _ = best_score;
     }
 
     // Final elapsed/nodes for result (not an event).
@@ -263,9 +313,16 @@ pub fn search(
 /// One iterative-deepening iteration at the root.
 ///
 /// Generates root moves, puts the previous iteration's best first, then
-/// searches each move with `negamax`.  Returns the best move and its score,
-/// or `None` if the search was aborted mid-iteration.
-fn root_search(pos: &mut Position, depth: i32, ctx: &mut SearchContext) -> Option<(Move, i32)> {
+/// searches each move with `negamax` using PVS. Returns the best move and
+/// its score, or `None` if the search was aborted mid-iteration.
+/// The window `[alpha, beta]` is the aspiration window from the ID loop.
+fn root_search(
+    pos: &mut Position,
+    depth: i32,
+    mut alpha: i32,
+    beta: i32,
+    ctx: &mut SearchContext,
+) -> Option<(Move, i32)> {
     let mut moves = Vec::new();
     generate_legal(pos, &mut moves);
     if moves.is_empty() {
@@ -282,33 +339,23 @@ fn root_search(pos: &mut Position, depth: i32, ctx: &mut SearchContext) -> Optio
 
     let mut best_move = moves[0];
     let mut best_score = -VALUE_INFINITE;
-    let mut alpha = -VALUE_INFINITE;
-    let beta = VALUE_INFINITE;
+    let orig_alpha = alpha;
 
-    // Clear PV for this iteration's root — it will be rebuilt by negamax.
-    // We keep the previous PV's move at pv_table[0][0] only for ordering
-    // above; negamax will overwrite pv_len[0] on its first PV raise.
-    // So cache the previous best before clearing.
     let _prev_best_cached = if ctx.pv_len[0] > 0 {
         ctx.pv_table[0][0]
     } else {
         None
     };
-    // Reset length so negamax starts fresh (but ordering already done).
-    // Don't wipe the table itself — the previous PV move is still useful for
-    // ordering; we just let negamax set pv_len[0] when it finds a PV.
-    // Instead, leave pv_len as is and let the first PV update overwrite.
-    // So we don't reset here.
 
     for i in 0..moves.len() {
-        // Incremental pick-best for the rest (skip i==0 which is prev best).
         if i > 0 {
             let best_idx = {
                 let slice = &moves[i..];
                 let mut best = 0;
-                let mut best_s = order::score_move(pos, slice[0]);
+                let mut best_s =
+                    order::score_move(pos, slice[0], None, &ctx.killers[0], &ctx.history, 0);
                 for (j, &mv) in slice.iter().enumerate().skip(1) {
-                    let s = order::score_move(pos, mv);
+                    let s = order::score_move(pos, mv, None, &ctx.killers[0], &ctx.history, 0);
                     if s > best_s {
                         best_s = s;
                         best = j;
@@ -329,9 +376,18 @@ fn root_search(pos: &mut Position, depth: i32, ctx: &mut SearchContext) -> Optio
         }
 
         pos.make_move(mv);
-        // Full window for the first move, then zero-window for the rest is a
-        // Phase 4 optimisation; Phase 3 uses full window for all.
-        let score = -alpha_beta::negamax(pos, depth - 1, -beta, -alpha, 1, ctx);
+        let score = if i == 0 {
+            -alpha_beta::negamax(pos, depth - 1, -beta, -alpha, 1, true, ctx)
+        } else {
+            // PVS zero-window
+            let v = -alpha_beta::negamax(pos, depth - 1, -alpha - 1, -alpha, 1, true, ctx);
+            if v > alpha && v < beta {
+                // Re-search with full window (PV node)
+                -alpha_beta::negamax(pos, depth - 1, -beta, -alpha, 1, true, ctx)
+            } else {
+                v
+            }
+        };
         pos.unmake_move(mv);
 
         if ctx.stop.load(Ordering::Relaxed) {
@@ -344,15 +400,16 @@ fn root_search(pos: &mut Position, depth: i32, ctx: &mut SearchContext) -> Optio
         }
         if score > alpha {
             alpha = score;
-            // Update root PV.
             ctx.pv_table[0][0] = Some(mv);
             let child_len = ctx.pv_len[1];
             for j in 0..child_len {
                 ctx.pv_table[0][j + 1] = ctx.pv_table[1][j];
             }
             ctx.pv_len[0] = child_len + 1;
-            // Not cutting at root — we need the best among all moves.
         }
+        // No early cutoff at root — need best among all moves.
+        // Keep original alpha for fail-low detection (ID loop checks).
+        let _ = orig_alpha;
     }
 
     Some((best_move, best_score))
@@ -372,8 +429,9 @@ mod tests {
             infinite: false,
         };
         let stop = AtomicBool::new(false);
+        let tt = std::sync::Arc::new(crate::search::tt::TranspositionTable::new(1));
         let mut events = Vec::new();
-        let res = search(&mut pos, limits, &stop, &mut |e| events.push(e));
+        let res = search(&mut pos, limits, &stop, &tt, &mut |e| events.push(e));
         assert!(!events.is_empty() || depth == 0);
         res
     }
@@ -481,8 +539,9 @@ mod tests {
             infinite: false,
         };
         let stop = AtomicBool::new(false);
+        let tt = std::sync::Arc::new(crate::search::tt::TranspositionTable::new(1));
         let mut pv = Vec::new();
-        let _ = search(&mut pos, limits, &stop, &mut |e| {
+        let _ = search(&mut pos, limits, &stop, &tt, &mut |e| {
             pv = e.pv.clone();
         });
         // Validate PV plays legally

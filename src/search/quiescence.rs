@@ -72,7 +72,7 @@ pub fn quiescence(
     {
         let mut scored: Vec<(i32, crate::board::Move)> = moves
             .into_iter()
-            .map(|mv| (crate::search::order::score_move(pos, mv), mv))
+            .map(|mv| (crate::search::order::score_move_simple(pos, mv), mv))
             .collect();
         scored.sort_by_key(|b| std::cmp::Reverse(b.0));
         moves = scored.into_iter().map(|(_, mv)| mv).collect();

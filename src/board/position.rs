@@ -627,6 +627,75 @@ impl Position {
     }
 
     // -----------------------------------------------------------------------
+    // Null move + material helpers
+    // -----------------------------------------------------------------------
+
+    /// True if `color` has any non-pawn, non-king material.
+    /// Used to avoid null-move pruning in zugzwang-prone endings
+    /// (K+P vs K, etc.).
+    pub fn has_non_pawn_material(&self, color: Color) -> bool {
+        for pt in [
+            PieceType::Knight,
+            PieceType::Bishop,
+            PieceType::Rook,
+            PieceType::Queen,
+        ] {
+            let bb = self.pieces_bb(Piece::new(color, pt));
+            if !bb.is_empty() {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Make a null move: pass the turn, clear en passant, flip side, update hash.
+    /// Pushes an undo record so `unmake_null_move` restores everything.
+    /// Increments halfmove (a null is a reversible ply).
+    pub fn make_null_move(&mut self) {
+        let undo = UndoInfo {
+            captured: None,
+            captured_sq: None,
+            castling: self.castling,
+            en_passant: self.en_passant,
+            halfmove: self.halfmove,
+            hash: self.hash,
+        };
+        let old_hash = self.hash;
+        let old_ep = self.en_passant;
+        self.history.push(undo);
+
+        // Incremental hash: side + old en passant file
+        let keys = zobrist::keys();
+        let mut new_hash = old_hash;
+        new_hash ^= keys.side;
+        if let Some(ep) = old_ep {
+            new_hash ^= keys.en_passant[ep.file() as usize];
+        }
+        self.hash = new_hash;
+        self.en_passant = None;
+        self.halfmove = self.halfmove.wrapping_add(1);
+        let prev_side = self.side_to_move;
+        self.side_to_move = self.side_to_move.opposite();
+        if prev_side == Color::Black {
+            self.fullmove = self.fullmove.wrapping_add(1);
+        }
+    }
+
+    /// Unmake the last null move.
+    pub fn unmake_null_move(&mut self) {
+        let undo = self.history.pop().expect("unmake_null without history");
+        // Restore side/fullmove
+        self.side_to_move = self.side_to_move.opposite();
+        if self.side_to_move == Color::Black {
+            self.fullmove = self.fullmove.wrapping_sub(1);
+        }
+        self.en_passant = undo.en_passant;
+        self.halfmove = undo.halfmove;
+        self.hash = undo.hash;
+        self.castling = undo.castling;
+    }
+
+    // -----------------------------------------------------------------------
     // Internal helpers for `fen.rs` (crate-private)
     // -----------------------------------------------------------------------
 

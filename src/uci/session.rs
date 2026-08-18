@@ -39,7 +39,7 @@ use std::sync::{
 };
 
 use crate::board::{Color, Move, Position, parse_fen};
-use crate::search::{MATE, MAX_PLY, SearchLimits};
+use crate::search::{MATE, MAX_PLY, SearchLimits, tt::TranspositionTable};
 use crate::uci::options::EngineOptions;
 use crate::uci::parse::{self, UciCommand};
 
@@ -69,17 +69,21 @@ pub struct UciSession {
     debug: bool,
     /// Current board position, updated by `position` commands.
     position: Position,
+    /// Shared transposition table (SMP-ready, lock-free).
+    tt: std::sync::Arc<TranspositionTable>,
     /// Running search, if any.
     search: Option<SearchHandle>,
 }
 
 impl UciSession {
     pub fn new(out: mpsc::Sender<String>) -> Self {
+        let tt_mib = EngineOptions::default().hash_mib;
         Self {
             out,
             options: EngineOptions::default(),
             debug: false,
             position: Position::startpos(),
+            tt: std::sync::Arc::new(TranspositionTable::new(tt_mib)),
             search: None,
         }
     }
@@ -128,7 +132,25 @@ impl UciSession {
                 UciCommand::IsReady => self.send("readyok").await,
                 UciCommand::Debug(on) => self.debug = on,
                 UciCommand::SetOption { name, value } => {
-                    self.options.set(&name, value.as_deref());
+                    let recognized = self.options.set(&name, value.as_deref());
+                    if recognized && name == "Hash" {
+                        if self.search_running() {
+                            self.send("info string error: cannot resize hash while searching")
+                                .await;
+                        } else {
+                            let mib = self.options.hash_mib;
+                            // Need &mut to resize; clone Arc if shared.
+                            // SAFETY: we checked no search is running, so we hold the only Arc.
+                            if let Some(tt_mut) = std::sync::Arc::get_mut(&mut self.tt) {
+                                tt_mut.resize(mib);
+                            } else {
+                                // Fallback: allocate a fresh table (old one drops when search releases)
+                                self.tt = std::sync::Arc::new(TranspositionTable::new(mib));
+                            }
+                        }
+                    } else if recognized && name == "Clear Hash" {
+                        self.tt.clear();
+                    }
                 }
                 // `position` — update the current board, applying the `moves` tail.
                 UciCommand::Position { fen, moves } => {
@@ -203,7 +225,7 @@ impl UciSession {
                     }
                 }
                 UciCommand::UciNewGame => {
-                    // No TT yet (Phase 4); just reap finished search if any.
+                    self.tt.clear();
                     self.reap_search_if_finished();
                 }
                 UciCommand::Register | UciCommand::Unknown => {}
@@ -278,19 +300,24 @@ impl UciSession {
             infinite,
         };
 
+        // Bump TT generation for this search.
+        self.tt.new_search();
+
         // Spawn the search thread.
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = Arc::clone(&stop);
         let pos_clone = self.position.clone();
         let out_clone = self.out.clone();
+        let tt_clone = std::sync::Arc::clone(&self.tt);
 
         let thread = std::thread::spawn(move || {
             let mut pos = pos_clone;
             let limits = limits;
             let stop = stop_clone;
             let out = out_clone;
+            let tt = tt_clone;
 
-            let result = crate::search::search(&mut pos, limits, &stop, &mut |event| {
+            let result = crate::search::search(&mut pos, limits, &stop, &tt, &mut |event| {
                 let score_str = if event.score.abs() >= MATE - MAX_PLY as i32 {
                     let mate_in = if event.score > 0 {
                         (MATE - event.score + 1) / 2

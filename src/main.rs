@@ -27,6 +27,7 @@
 //! subcommands are one-shot and exit without ever starting the UCI loop,
 //! mirroring `./stockfish bench` (UCI spec §5.1).
 
+mod bench;
 mod board;
 mod cli;
 mod eval;
@@ -87,14 +88,7 @@ fn main() {
             fen_file,
             limit_type,
         }) => {
-            // Phase 4 will wire this to the real search benchmark. For now
-            // we exit with a stub so `--help`/`bench --help` and the binary
-            // shape can be tested from Phase 0 onward.
-            eprintln!(
-                "bench: not yet implemented (Phase 4) — \
-                 got tt_size={tt_size} threads={threads} limit={limit} \
-                 fen_file={fen_file} limit_type={limit_type}"
-            );
+            bench::run_bench(tt_size, threads, limit, &fen_file, &limit_type);
             std::process::exit(0);
         }
         None => {

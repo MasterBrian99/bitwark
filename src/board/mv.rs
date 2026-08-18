@@ -84,6 +84,50 @@ impl Move {
     pub fn is_promotion(self) -> bool {
         self.promotion.is_some()
     }
+
+    /// Pack to a `u16` for TT storage: `from` 6 bits, `to` 6 bits, promo 3 bits.
+    ///
+    /// Promo bits: 0 = none, 1 = Q, 2 = R, 3 = B, 4 = N. Values 5-7 are invalid
+    /// and never produced by the engine. Flags (castle/EP/capture) are not
+    /// stored — `make_move` re-derives them from the position.
+    #[inline]
+    pub fn to_u16(self) -> u16 {
+        let promo_bits: u16 = match self.promotion {
+            None => 0,
+            Some(PieceType::Queen) => 1,
+            Some(PieceType::Rook) => 2,
+            Some(PieceType::Bishop) => 3,
+            Some(PieceType::Knight) => 4,
+            Some(_) => 0,
+        };
+        (self.from.index() as u16) | ((self.to.index() as u16) << 6) | (promo_bits << 12)
+    }
+
+    /// Unpack from `u16`. Returns `None` for out-of-range squares or invalid promo bits.
+    #[inline]
+    pub fn from_u16(v: u16) -> Option<Self> {
+        let from_idx = (v & 0x3F) as u8;
+        let to_idx = ((v >> 6) & 0x3F) as u8;
+        let promo_bits = (v >> 12) & 0x7;
+        if from_idx >= 64 || to_idx >= 64 {
+            return None;
+        }
+        let from = Square::new(from_idx);
+        let to = Square::new(to_idx);
+        let promotion = match promo_bits {
+            0 => None,
+            1 => Some(PieceType::Queen),
+            2 => Some(PieceType::Rook),
+            3 => Some(PieceType::Bishop),
+            4 => Some(PieceType::Knight),
+            _ => return None,
+        };
+        Some(Self {
+            from,
+            to,
+            promotion,
+        })
+    }
 }
 
 impl std::fmt::Display for Move {
