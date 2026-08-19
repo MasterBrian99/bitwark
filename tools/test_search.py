@@ -218,8 +218,11 @@ async def test_legality_random(engine: UciEngine) -> None:
         if best:
             mv = chess.Move.from_uci(best)
             check(mv in board.legal_moves, f"illegal bestmove {best} for fen {fen}")
-        # Info lines should be parseable
+        # Info lines should be parseable (ignore currmove progress lines)
         for line in infos:
+            if "currmove" in line:
+                check("depth" in line, f"currmove line missing depth: {line!r}")
+                continue
             check("depth" in line and "score" in line, f"info line missing depth/score: {line!r}")
             check("pv" in line or "nodes" in line, f"info line missing pv/nodes: {line!r}")
         # Depth should be monotonic if we have multiple infos

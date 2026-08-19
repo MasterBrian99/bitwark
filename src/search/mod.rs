@@ -109,20 +109,32 @@ impl SearchLimits {
 }
 
 // ---------------------------------------------------------------------------
-// Search event (one `info` line per completed iteration)
+// Search events — streamed to the session for `info` line formatting
 // ---------------------------------------------------------------------------
 
-/// One completed iterative-deepening iteration, to be formatted as a UCI
-/// `info` line by the caller.
+/// Events streamed from the search thread to the UCI session.
+///
+/// `Iteration` = one completed depth (the `info depth … pv …` line).
+/// `CurrMove`  = root move currently being searched (`currmove`/`currmovenumber`).
 #[derive(Debug, Clone)]
-pub struct SearchEvent {
-    pub depth: u8,
-    pub seldepth: usize,
-    pub score: i32,
-    pub nodes: u64,
-    pub time_ms: u64,
-    pub nps: u64,
-    pub pv: Vec<Move>,
+pub enum SearchEvent {
+    Iteration {
+        depth: u8,
+        seldepth: usize,
+        multipv: u32,
+        score: i32,
+        bound: Option<tt::Bound>,
+        nodes: u64,
+        time_ms: u64,
+        nps: u64,
+        hashfull: u32,
+        pv: Vec<Move>,
+    },
+    CurrMove {
+        depth: u8,
+        currmove: Move,
+        number: usize,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -299,9 +311,10 @@ pub fn search(
         }
 
         let mut iteration_best: Option<(Move, i32)> = None;
-        // Aspiration re-search loop.
+        // Aspiration re-search loop. On fail-high/low emit a bound-flagged
+        // iteration event so GUIs see lowerbound/upperbound.
         loop {
-            let res = root_search(pos, depth as i32, alpha, beta, &mut ctx);
+            let res = root_search(pos, depth as i32, alpha, beta, &mut ctx, on_event);
             if stop.load(Ordering::Relaxed) {
                 break;
             }
@@ -309,7 +322,27 @@ pub fn search(
                 break;
             };
             if score <= alpha {
-                // Fail low — widen window downward.
+                // Fail low — widen window downward; emit upperbound.
+                {
+                    let elapsed = ctx.tc.elapsed_ms();
+                    let nps = if elapsed > 0 {
+                        ctx.nodes * 1000 / elapsed
+                    } else {
+                        ctx.nodes
+                    };
+                    on_event(SearchEvent::Iteration {
+                        depth: depth as u8,
+                        seldepth: ctx.seldepth,
+                        multipv: 1,
+                        score,
+                        bound: Some(tt::Bound::Upper),
+                        nodes: ctx.nodes,
+                        time_ms: elapsed,
+                        nps,
+                        hashfull: ctx.tt.hashfull_permille(),
+                        pv: Vec::new(),
+                    });
+                }
                 beta = (alpha + beta) / 2;
                 alpha -= delta;
                 delta += delta / 2;
@@ -317,10 +350,29 @@ pub fn search(
                     alpha = -VALUE_INFINITE;
                     beta = VALUE_INFINITE;
                 }
-                // Don't emit; try again at same depth with wider window.
                 continue;
             } else if score >= beta {
-                // Fail high — widen upward.
+                // Fail high — widen upward; emit lowerbound.
+                {
+                    let elapsed = ctx.tc.elapsed_ms();
+                    let nps = if elapsed > 0 {
+                        ctx.nodes * 1000 / elapsed
+                    } else {
+                        ctx.nodes
+                    };
+                    on_event(SearchEvent::Iteration {
+                        depth: depth as u8,
+                        seldepth: ctx.seldepth,
+                        multipv: 1,
+                        score,
+                        bound: Some(tt::Bound::Lower),
+                        nodes: ctx.nodes,
+                        time_ms: elapsed,
+                        nps,
+                        hashfull: ctx.tt.hashfull_permille(),
+                        pv: Vec::new(),
+                    });
+                }
                 beta += delta;
                 delta += delta / 2;
                 if delta > 500 {
@@ -337,6 +389,28 @@ pub fn search(
         }
 
         if stop.load(Ordering::Relaxed) {
+            // Mid-iteration abort: emit final summary of last completed
+            // iteration (if any) per UCI spec §2.9 before breaking.
+            if !best_pv.is_empty() {
+                let elapsed = ctx.tc.elapsed_ms();
+                let nps = if elapsed > 0 {
+                    ctx.nodes * 1000 / elapsed
+                } else {
+                    ctx.nodes
+                };
+                on_event(SearchEvent::Iteration {
+                    depth: (depth as u8).saturating_sub(1),
+                    seldepth: ctx.seldepth,
+                    multipv: 1,
+                    score: best_score,
+                    bound: None,
+                    nodes: ctx.nodes,
+                    time_ms: elapsed,
+                    nps,
+                    hashfull: ctx.tt.hashfull_permille(),
+                    pv: best_pv.clone(),
+                });
+            }
             break;
         }
         let Some((mv, score)) = iteration_best else {
@@ -369,16 +443,18 @@ pub fn search(
         };
         last_iter_ms = elapsed_ms;
 
-        let event = SearchEvent {
+        on_event(SearchEvent::Iteration {
             depth: depth as u8,
             seldepth: ctx.seldepth,
+            multipv: 1,
             score,
+            bound: None,
             nodes: ctx.nodes,
             time_ms: elapsed_ms,
             nps,
+            hashfull: ctx.tt.hashfull_permille(),
             pv: pv.clone(),
-        };
-        on_event(event);
+        });
 
         let _ = best_score;
     }
@@ -404,6 +480,7 @@ fn root_search(
     mut alpha: i32,
     beta: i32,
     ctx: &mut SearchContext,
+    on_event: &mut dyn FnMut(SearchEvent),
 ) -> Option<(Move, i32)> {
     let mut moves = Vec::new();
     generate_legal(pos, &mut moves);
@@ -437,6 +514,7 @@ fn root_search(
         None
     };
 
+    let mut last_curr_emit_ms: u64 = 0;
     for i in 0..moves.len() {
         if i > 0 {
             let best_idx = {
@@ -456,6 +534,20 @@ fn root_search(
             moves.swap(i, i + best_idx);
         }
         let mv = moves[i];
+
+        // currmove / currmovenumber — UCI spec §3.4
+        {
+            let now = ctx.tc.elapsed_ms();
+            let do_emit = depth <= 1 || now.saturating_sub(last_curr_emit_ms) >= 100;
+            if do_emit {
+                last_curr_emit_ms = now;
+                on_event(SearchEvent::CurrMove {
+                    depth: depth as u8,
+                    currmove: mv,
+                    number: i + 1,
+                });
+            }
+        }
 
         if ctx.stop.load(Ordering::Relaxed) {
             return None;
@@ -531,9 +623,12 @@ mod tests {
         let stop = AtomicBool::new(false);
         let tc = Arc::new(TimeControl::none());
         let tt = Arc::new(crate::search::tt::TranspositionTable::new(1));
-        let mut events = Vec::new();
+        let mut events: Vec<SearchEvent> = Vec::new();
         let res = search(&mut pos, limits, &stop, &tc, &tt, &mut |e| events.push(e));
-        assert!(!events.is_empty() || depth == 0);
+        let has_iter = events
+            .iter()
+            .any(|e| matches!(e, SearchEvent::Iteration { .. }));
+        assert!(has_iter || depth == 0);
         res
     }
 
@@ -643,7 +738,9 @@ mod tests {
         let tt = Arc::new(crate::search::tt::TranspositionTable::new(1));
         let mut pv = Vec::new();
         let _ = search(&mut pos, limits, &stop, &tc, &tt, &mut |e| {
-            pv = e.pv.clone();
+            if let SearchEvent::Iteration { pv: p, .. } = e {
+                pv = p.clone();
+            }
         });
         // Validate PV plays legally
         let mut tmp = parse_fen(fen).unwrap();

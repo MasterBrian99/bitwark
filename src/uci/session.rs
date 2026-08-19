@@ -357,43 +357,56 @@ impl UciSession {
             let tt = tt_clone;
 
             let result = crate::search::search(&mut pos, limits, &stop, &tc, &tt, &mut |event| {
-                let score_str = if event.score.abs() >= MATE - MAX_PLY as i32 {
-                    let mate_in = if event.score > 0 {
-                        (MATE - event.score + 1) / 2
-                    } else {
-                        -((MATE + event.score + 1) / 2)
-                    };
-                    format!("mate {mate_in}")
-                } else {
-                    format!("cp {}", event.score)
-                };
-                let pv_str = event
-                    .pv
-                    .iter()
-                    .map(|m| m.to_string())
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                let line = if pv_str.is_empty() {
-                    format!(
-                        "info depth {} seldepth {} score {} nodes {} nps {} time {}",
-                        event.depth,
-                        event.seldepth,
-                        score_str,
-                        event.nodes,
-                        event.nps,
-                        event.time_ms
-                    )
-                } else {
-                    format!(
-                        "info depth {} seldepth {} score {} nodes {} nps {} time {} pv {}",
-                        event.depth,
-                        event.seldepth,
-                        score_str,
-                        event.nodes,
-                        event.nps,
-                        event.time_ms,
-                        pv_str
-                    )
+                let line = match event {
+                    crate::search::SearchEvent::Iteration {
+                        depth,
+                        seldepth,
+                        multipv,
+                        score,
+                        bound,
+                        nodes,
+                        time_ms,
+                        nps,
+                        hashfull,
+                        pv,
+                    } => {
+                        let score_base = if score.abs() >= MATE - MAX_PLY as i32 {
+                            let mate_in = if score > 0 {
+                                (MATE - score + 1) / 2
+                            } else {
+                                -((MATE + score + 1) / 2)
+                            };
+                            format!("mate {mate_in}")
+                        } else {
+                            format!("cp {score}")
+                        };
+                        let bound_suffix = match bound {
+                            Some(crate::search::tt::Bound::Lower) => " lowerbound",
+                            Some(crate::search::tt::Bound::Upper) => " upperbound",
+                            _ => "",
+                        };
+                        let pv_str = pv
+                            .iter()
+                            .map(|m| m.to_string())
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        if pv_str.is_empty() {
+                            format!(
+                                "info depth {depth} seldepth {seldepth} multipv {multipv} score {score_base}{bound_suffix} nodes {nodes} nps {nps} hashfull {hashfull} time {time_ms}"
+                            )
+                        } else {
+                            format!(
+                                "info depth {depth} seldepth {seldepth} multipv {multipv} score {score_base}{bound_suffix} nodes {nodes} nps {nps} hashfull {hashfull} time {time_ms} pv {pv_str}"
+                            )
+                        }
+                    }
+                    crate::search::SearchEvent::CurrMove {
+                        depth,
+                        currmove,
+                        number,
+                    } => {
+                        format!("info depth {depth} currmove {currmove} currmovenumber {number}")
+                    }
                 };
                 let _ = out.blocking_send(line);
             });
