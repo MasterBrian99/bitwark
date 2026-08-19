@@ -13,15 +13,21 @@
 //!                    └──────────────────── stop ───────────────────────────┘
 //! ```
 
+#![allow(clippy::collapsible_if)]
+#![allow(clippy::manual_checked_ops)]
+
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
 
 use crate::board::{Move, Position, generate_legal, is_square_attacked};
 
 pub mod alpha_beta;
 pub mod order;
 pub mod quiescence;
+pub mod time;
 pub mod tt;
+
+use time::TimeControl;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -41,28 +47,64 @@ pub const MAX_PLY: usize = 128;
 
 /// What the search is allowed to do.  Built from `GoParams` by the UCI
 /// session; the search itself only sees this struct.
+///
+/// Time limits live in the shared `TimeControl` (soft/hard, pondering),
+/// not here — `SearchLimits` holds the discrete counters/flags.
 #[derive(Debug, Clone)]
 pub struct SearchLimits {
     /// Nominal depth limit, if any.
     pub depth: Option<u8>,
-    /// Hard wall-clock limit in ms (from `movetime` or minimal clock fallback).
-    pub movetime_ms: Option<u64>,
+    /// Approximate node-count limit, if any.
+    pub nodes: Option<u64>,
+    /// Search for mate in this many moves, if any.
+    pub mate: Option<u8>,
     /// Search forever until `stop` (uci `go infinite`).
     pub infinite: bool,
+    /// Pondering mode (`go ponder`); search doesn't stop on mate/time.
+    pub ponder: bool,
+    /// Number of principal variations (MultiPV).
+    #[allow(dead_code)]
+    pub multipv: u32,
+    /// Restrict root to these moves (empty = unrestricted).
+    pub searchmoves: Vec<Move>,
+}
+
+impl Default for SearchLimits {
+    fn default() -> Self {
+        Self {
+            depth: None,
+            nodes: None,
+            mate: None,
+            infinite: false,
+            ponder: false,
+            multipv: 1,
+            searchmoves: Vec::new(),
+        }
+    }
 }
 
 impl SearchLimits {
     /// Maximum nominal depth for iterative deepening.
-    pub fn max_depth(&self) -> usize {
-        if let Some(d) = self.depth {
-            (d as usize).min(MAX_PLY)
-        } else if self.infinite || self.movetime_ms.is_some() {
-            // Time-limited or infinite: allow deep but capped by MAX_PLY.
-            MAX_PLY
-        } else {
-            // Bare `go` — UCI spec §2.8: treat as very deep (Stockfish 245).
-            245.min(MAX_PLY)
+    ///
+    /// When a time control is active (`tc` has limits) we allow deep search
+    /// up to `MAX_PLY` — the time manager stops us. Bare `go` (no depth, no
+    /// mate, no infinite, no time) is the implicit depth 245 per UCI spec §2.8.
+    pub fn max_depth(&self, tc: &TimeControl) -> usize {
+        if let Some(m) = self.mate {
+            return (m as usize * 2).min(MAX_PLY);
         }
+        if let Some(d) = self.depth {
+            return (d as usize).min(MAX_PLY);
+        }
+        if self.infinite {
+            return MAX_PLY;
+        }
+        // Time-limited go (soft or hard > 0) → deep, stopped by Tc.
+        if tc.soft_ms() > 0 || tc.hard_ms() > 0 {
+            return MAX_PLY;
+        }
+        // Bare `go` — UCI spec §2.8: treat as very deep (Stockfish 245).
+        245.min(MAX_PLY)
     }
 }
 
@@ -106,10 +148,10 @@ pub struct SearchContext<'a> {
     pub pv_table: [[Option<Move>; MAX_PLY]; MAX_PLY],
     pub pv_len: [usize; MAX_PLY],
     pub stop: &'a AtomicBool,
-    pub start: Instant,
     pub limits: SearchLimits,
+    pub tc: Arc<TimeControl>,
     /// Shared TT (SMP-ready, lock-free).
-    pub tt: std::sync::Arc<tt::TranspositionTable>,
+    pub tt: Arc<tt::TranspositionTable>,
     /// Killers: two quiet moves per ply that caused a beta cutoff.
     #[allow(dead_code)]
     pub killers: [[Option<Move>; 2]; MAX_PLY],
@@ -122,8 +164,8 @@ impl<'a> SearchContext<'a> {
     pub fn new(
         stop: &'a AtomicBool,
         limits: SearchLimits,
-        start: Instant,
-        tt: std::sync::Arc<tt::TranspositionTable>,
+        tc: Arc<TimeControl>,
+        tt: Arc<tt::TranspositionTable>,
     ) -> Self {
         Self {
             nodes: 0,
@@ -131,21 +173,11 @@ impl<'a> SearchContext<'a> {
             pv_table: [[None; MAX_PLY]; MAX_PLY],
             pv_len: [0; MAX_PLY],
             stop,
-            start,
             limits,
+            tc,
             tt,
             killers: [[None; 2]; MAX_PLY],
             history: Box::new([[[0; 64]; 64]; 2]),
-        }
-    }
-
-    /// Check whether the hard movetime limit has been reached.
-    #[inline]
-    pub fn should_stop_time(&self) -> bool {
-        if let Some(ms) = self.limits.movetime_ms {
-            self.start.elapsed() >= Duration::from_millis(ms)
-        } else {
-            false
         }
     }
 }
@@ -163,17 +195,26 @@ pub fn search(
     pos: &mut Position,
     limits: SearchLimits,
     stop: &AtomicBool,
-    tt: &std::sync::Arc<tt::TranspositionTable>,
+    tc: &Arc<TimeControl>,
+    tt: &Arc<tt::TranspositionTable>,
     on_event: &mut dyn FnMut(SearchEvent),
 ) -> SearchResult {
-    let start = Instant::now();
-    let max_depth = limits.max_depth();
+    let max_depth = limits.max_depth(tc);
     tt.new_search();
-    let mut ctx = SearchContext::new(stop, limits.clone(), start, std::sync::Arc::clone(tt));
+    let mut ctx = SearchContext::new(stop, limits.clone(), Arc::clone(tc), Arc::clone(tt));
 
-    // Root legal moves — if none, return immediately (mate/stalemate).
+    // Root legal moves — filtered by searchmoves if present (Phase 6b), but
+    // 6a already stores the filtered list; fallback if intersection empty.
     let mut root_moves = Vec::new();
     generate_legal(pos, &mut root_moves);
+    if !ctx.limits.searchmoves.is_empty() {
+        let original = root_moves.clone();
+        root_moves.retain(|m| ctx.limits.searchmoves.contains(m));
+        if root_moves.is_empty() {
+            root_moves = original;
+        }
+        // Empty intersection → fall back to unrestricted (guaranteed legal move).
+    }
     if root_moves.is_empty() {
         // Score the root position itself for the info line (mate/stalemate/draw).
         let score = if let Some(king_sq) = pos.king_square(pos.side_to_move()) {
@@ -197,15 +238,55 @@ pub fn search(
     let mut best_score: i32 = 0;
     let mut best_pv: Vec<Move> = vec![best_move];
     let mut prev_score: i32 = 0;
+    let mut last_iter_ms: u64 = 0;
 
     // Iterative deepening with aspiration windows.
     for depth in 1..=max_depth {
         if stop.load(Ordering::Relaxed) {
             break;
         }
-        if ctx.should_stop_time() {
+        if ctx.tc.should_hard_stop() {
             stop.store(true, Ordering::Relaxed);
             break;
+        }
+        // Soft limit: don't start a new iteration if we've used our optimum.
+        if ctx.tc.should_soft_stop() {
+            break;
+        }
+        // Heuristic: don't start an iteration we expect not to finish.
+        // Last iteration's wall time is a good predictor; growth is ~2×.
+        // Only for clock-based TC (soft != hard); for exact movetime
+        // (soft == hard) we rely on the hard abort mid-iteration instead so
+        // we fully use the allocated time.
+        if depth > 1
+            && ctx.tc.hard_ms() > 0
+            && ctx.tc.soft_ms() != ctx.tc.hard_ms()
+            && last_iter_ms > 0
+        {
+            let elapsed = ctx.tc.elapsed_ms();
+            if elapsed + 2 * last_iter_ms > ctx.tc.hard_ms() {
+                break;
+            }
+        }
+        // Early mate stop: proven mate found and no explicit depth requested.
+        // Guarded so `go depth N` always completes to N (bench determinism +
+        // uci.md semantics) and pondering doesn't stop on mate (§2.8).
+        if depth > 1
+            && !ctx.limits.ponder
+            && !ctx.limits.infinite
+            && ctx.limits.depth.is_none()
+            && ctx.limits.mate.is_none()
+            && ctx.tc.soft_ms() > 0
+            && prev_score.abs() >= MATE - MAX_PLY as i32
+        {
+            break;
+        }
+        // Depth-mate limit: if searching for mate in N, stop once it's proven.
+        // (Checked after each iteration; nodes limit checked per-node in negamax.)
+        if let Some(mate_n) = ctx.limits.mate {
+            if prev_score >= MATE - 2 * mate_n as i32 {
+                break;
+            }
         }
 
         // Aspiration window (depth >=5 and not a mate score).
@@ -279,13 +360,14 @@ pub fn search(
         best_score = score;
         best_pv = pv.clone();
 
-        let elapsed_ms = start.elapsed().as_millis() as u64;
-        #[allow(clippy::manual_checked_ops)]
+        let elapsed_ms = ctx.tc.elapsed_ms();
+        // For `none()` tc elapsed is 0; for nps fallback use 1ms grace so nps is finite.
         let nps = if elapsed_ms > 0 {
             ctx.nodes * 1000 / elapsed_ms
         } else {
             ctx.nodes
         };
+        last_iter_ms = elapsed_ms;
 
         let event = SearchEvent {
             depth: depth as u8,
@@ -325,6 +407,14 @@ fn root_search(
 ) -> Option<(Move, i32)> {
     let mut moves = Vec::new();
     generate_legal(pos, &mut moves);
+    // Apply searchmoves filter if present (mirrors the ID prologue).
+    if !ctx.limits.searchmoves.is_empty() {
+        let original = moves.clone();
+        moves.retain(|m| ctx.limits.searchmoves.contains(m));
+        if moves.is_empty() {
+            moves = original;
+        }
+    }
     if moves.is_empty() {
         return None;
     }
@@ -370,9 +460,20 @@ fn root_search(
         if ctx.stop.load(Ordering::Relaxed) {
             return None;
         }
-        if ctx.nodes.is_multiple_of(2048) && ctx.should_stop_time() {
+        if ctx.tc.should_hard_stop() {
             ctx.stop.store(true, Ordering::Relaxed);
             return None;
+        }
+        if ctx.nodes.is_multiple_of(2048) && ctx.tc.should_hard_stop() {
+            ctx.stop.store(true, Ordering::Relaxed);
+            return None;
+        }
+        // Nodes limit (approximate; checked every node because it's a plain u64).
+        if let Some(limit) = ctx.limits.nodes {
+            if ctx.nodes >= limit {
+                ctx.stop.store(true, Ordering::Relaxed);
+                return None;
+            }
         }
 
         pos.make_move(mv);
@@ -425,13 +526,13 @@ mod tests {
         let mut pos = parse_fen(fen).unwrap();
         let limits = SearchLimits {
             depth: Some(depth),
-            movetime_ms: None,
-            infinite: false,
+            ..Default::default()
         };
         let stop = AtomicBool::new(false);
-        let tt = std::sync::Arc::new(crate::search::tt::TranspositionTable::new(1));
+        let tc = Arc::new(TimeControl::none());
+        let tt = Arc::new(crate::search::tt::TranspositionTable::new(1));
         let mut events = Vec::new();
-        let res = search(&mut pos, limits, &stop, &tt, &mut |e| events.push(e));
+        let res = search(&mut pos, limits, &stop, &tc, &tt, &mut |e| events.push(e));
         assert!(!events.is_empty() || depth == 0);
         res
     }
@@ -535,13 +636,13 @@ mod tests {
         let mut pos = parse_fen(fen).unwrap();
         let limits = SearchLimits {
             depth: Some(3),
-            movetime_ms: None,
-            infinite: false,
+            ..Default::default()
         };
         let stop = AtomicBool::new(false);
-        let tt = std::sync::Arc::new(crate::search::tt::TranspositionTable::new(1));
+        let tc = Arc::new(TimeControl::none());
+        let tt = Arc::new(crate::search::tt::TranspositionTable::new(1));
         let mut pv = Vec::new();
-        let _ = search(&mut pos, limits, &stop, &tt, &mut |e| {
+        let _ = search(&mut pos, limits, &stop, &tc, &tt, &mut |e| {
             pv = e.pv.clone();
         });
         // Validate PV plays legally

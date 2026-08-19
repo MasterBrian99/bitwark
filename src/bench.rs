@@ -16,7 +16,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use crate::board::fen::parse_fen;
-use crate::search::{SearchLimits, tt::TranspositionTable};
+use crate::search::{SearchLimits, time::TimeControl, tt::TranspositionTable};
 
 /// Default FEN suite (~12 positions). Keep it stable — the signature depends on it.
 pub const DEFAULT_FENS: &[&str] = &[
@@ -145,21 +145,17 @@ pub fn run_bench(
         };
         let limits = SearchLimits {
             depth: depth_limit,
-            movetime_ms: movetime_limit,
-            infinite: false,
+            nodes: nodes_limit,
+            ..Default::default()
         };
-        // Nodes limit is handled via stop flag checked periodically.
-        // Bench is depth-limited, so nodes limit is rare; we support it by
-        // polling nodes count in a background check — simplest: wrap search
-        // with a stop that triggers when nodes >= limit. Our search already
-        // checks should_stop_time every 2048 nodes; for nodes limit we can
-        // reuse the same hook by storing limit in a separate AtomicU64?
-        // For now, for nodes limit we just search with depth cap and ignore
-        // the nodes limit if not depth — the gate uses depth anyway.
-        let _ = nodes_limit; // suppress unused warning; nodes limit not yet wired into SearchLimits
+        let tc = if let Some(ms) = movetime_limit {
+            Arc::new(TimeControl::for_movetime(ms))
+        } else {
+            Arc::new(TimeControl::none())
+        };
         let stop = AtomicBool::new(false);
         // Run search; nodes are accumulated via ctx.nodes, returned in result.
-        let result = crate::search::search(&mut pos, limits, &stop, &tt, &mut |_event| {
+        let result = crate::search::search(&mut pos, limits, &stop, &tc, &tt, &mut |_event| {
             // Suppress per-iteration info — bench is quiet.
         });
         total_nodes += result.nodes;

@@ -7,6 +7,7 @@
 //! "Late Move Reductions", "Futility Pruning", "Check Extensions".
 
 #![allow(clippy::needless_range_loop)]
+#![allow(clippy::collapsible_if)]
 
 use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
@@ -97,9 +98,19 @@ pub fn negamax(
     if ctx.stop.load(Ordering::Relaxed) {
         return 0;
     }
-    if ctx.nodes.is_multiple_of(2048) && ctx.should_stop_time() {
+    if ctx.tc.should_hard_stop() {
         ctx.stop.store(true, Ordering::Relaxed);
         return 0;
+    }
+    if ctx.nodes.is_multiple_of(2048) && ctx.tc.should_hard_stop() {
+        ctx.stop.store(true, Ordering::Relaxed);
+        return 0;
+    }
+    if let Some(limit) = ctx.limits.nodes {
+        if ctx.nodes >= limit {
+            ctx.stop.store(true, Ordering::Relaxed);
+            return 0;
+        }
     }
 
     if ply >= MAX_PLY - 1 {

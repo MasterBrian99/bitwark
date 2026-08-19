@@ -30,6 +30,8 @@
 //! *stateless between commands*: each line is handled on its own, and any
 //! line we don't understand is silently ignored (UCI spec §1).
 
+#![allow(clippy::collapsible_if)]
+
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
@@ -39,7 +41,7 @@ use std::sync::{
 };
 
 use crate::board::{Color, Move, Position, parse_fen};
-use crate::search::{MATE, MAX_PLY, SearchLimits, tt::TranspositionTable};
+use crate::search::{MATE, MAX_PLY, SearchLimits, time::TimeControl, tt::TranspositionTable};
 use crate::uci::options::EngineOptions;
 use crate::uci::parse::{self, UciCommand};
 
@@ -53,6 +55,8 @@ pub const ENGINE_AUTHOR: &str = "Brian";
 struct SearchHandle {
     thread: std::thread::JoinHandle<()>,
     stop: Arc<AtomicBool>,
+    tc: Arc<TimeControl>,
+    done: Arc<AtomicBool>,
 }
 
 /// Live protocol state for one engine process.
@@ -70,7 +74,7 @@ pub struct UciSession {
     /// Current board position, updated by `position` commands.
     position: Position,
     /// Shared transposition table (SMP-ready, lock-free).
-    tt: std::sync::Arc<TranspositionTable>,
+    tt: Arc<TranspositionTable>,
     /// Running search, if any.
     search: Option<SearchHandle>,
 }
@@ -83,7 +87,7 @@ impl UciSession {
             options: EngineOptions::default(),
             debug: false,
             position: Position::startpos(),
-            tt: std::sync::Arc::new(TranspositionTable::new(tt_mib)),
+            tt: Arc::new(TranspositionTable::new(tt_mib)),
             search: None,
         }
     }
@@ -91,6 +95,12 @@ impl UciSession {
     /// True if a search is currently running.
     fn search_running(&self) -> bool {
         if let Some(h) = &self.search {
+            // `done` is set by the thread immediately after sending bestmove.
+            // Using `done` closes the race where `is_finished()` is still false
+            // but bestmove is already out and the GUI has sent the next `go`.
+            if h.done.load(Ordering::Relaxed) {
+                return false;
+            }
             !h.thread.is_finished()
         } else {
             false
@@ -100,11 +110,15 @@ impl UciSession {
     /// Reap a finished search handle (join the thread).  Call before spawning
     /// a new search or on quit.
     fn reap_search_if_finished(&mut self) {
-        if let Some(h) = &self.search
-            && h.thread.is_finished()
-        {
-            let h = self.search.take().unwrap();
-            let _ = h.thread.join();
+        let is_done = if let Some(h) = &self.search {
+            h.done.load(Ordering::Relaxed) || h.thread.is_finished()
+        } else {
+            false
+        };
+        if is_done {
+            if let Some(h) = self.search.take() {
+                let _ = h.thread.join();
+            }
         }
     }
 
@@ -132,21 +146,17 @@ impl UciSession {
                 UciCommand::IsReady => self.send("readyok").await,
                 UciCommand::Debug(on) => self.debug = on,
                 UciCommand::SetOption { name, value } => {
+                    // UCI spec §7: setoption only processed while idle.
+                    if self.search_running() {
+                        continue;
+                    }
                     let recognized = self.options.set(&name, value.as_deref());
                     if recognized && name == "Hash" {
-                        if self.search_running() {
-                            self.send("info string error: cannot resize hash while searching")
-                                .await;
+                        let mib = self.options.hash_mib;
+                        if let Some(tt_mut) = Arc::get_mut(&mut self.tt) {
+                            tt_mut.resize(mib);
                         } else {
-                            let mib = self.options.hash_mib;
-                            // Need &mut to resize; clone Arc if shared.
-                            // SAFETY: we checked no search is running, so we hold the only Arc.
-                            if let Some(tt_mut) = std::sync::Arc::get_mut(&mut self.tt) {
-                                tt_mut.resize(mib);
-                            } else {
-                                // Fallback: allocate a fresh table (old one drops when search releases)
-                                self.tt = std::sync::Arc::new(TranspositionTable::new(mib));
-                            }
+                            self.tt = Arc::new(TranspositionTable::new(mib));
                         }
                     } else if recognized && name == "Clear Hash" {
                         self.tt.clear();
@@ -250,12 +260,8 @@ impl UciSession {
                     }
                 }
                 UciCommand::PonderHit => {
-                    // Pondering not yet implemented (Phase 6) — treat like stop
-                    // for correctness: if pondering, stop the ponder search and
-                    // the GUI should send a real `go` afterwards.  For now just
-                    // signal stop if a search is running.
                     if let Some(h) = &self.search {
-                        h.stop.store(true, Ordering::Relaxed);
+                        h.tc.ponderhit();
                     }
                 }
                 UciCommand::UciNewGame => {
@@ -277,31 +283,17 @@ impl UciSession {
         // Reap any finished handle before spawning.
         self.reap_search_if_finished();
 
-        // Warn about unsupported limits (Phase 6 will handle them).
-        if !params.searchmoves.is_empty() {
-            self.send("info string searchmoves not yet supported (Phase 6)")
-                .await;
-        }
-        if params.mate.is_some() {
-            self.send("info string mate limit not yet supported (Phase 6)")
-                .await;
-        }
-        if params.nodes.is_some() {
-            self.send("info string nodes limit not yet supported (Phase 6)")
-                .await;
-        }
+        // Ponder warning stays until 6d fully implements the workflow;
+        // searchmoves/mate/nodes are now handled (6a/6b).
         if params.ponder {
             self.send("info string ponder not yet supported (Phase 6)")
                 .await;
         }
 
-        // Build limits.
-        let depth = params.depth;
-        let mut movetime_ms = params.movetime;
-        let infinite = params.infinite || params.ponder;
-
-        // Minimal clock fallback for time controls (Phase 6 is full management).
-        if depth.is_none() && movetime_ms.is_none() && !infinite {
+        // Build TimeControl.
+        let tc = if let Some(mt) = params.movetime {
+            Arc::new(TimeControl::for_movetime(mt))
+        } else {
             let time_opt = match self.position.side_to_move() {
                 Color::White => params.wtime,
                 Color::Black => params.btime,
@@ -310,28 +302,36 @@ impl UciSession {
                 Color::White => params.winc,
                 Color::Black => params.binc,
             };
-            if let Some(time) = time_opt {
+            if let Some(rem) = time_opt {
                 let inc = inc_opt.unwrap_or(0);
-                let base = if let Some(mtg) = params.movestogo {
-                    if mtg > 0 {
-                        time / mtg as u64
-                    } else {
-                        time / 20
-                    }
-                } else {
-                    time / 20
-                };
-                let mt = base + inc * 3 / 4;
-                let overhead = 10u64;
-                let clamped = mt.clamp(10, time.saturating_sub(overhead).max(10));
-                movetime_ms = Some(clamped);
+                Arc::new(TimeControl::for_clock(
+                    rem,
+                    inc,
+                    params.movestogo,
+                    self.options.move_overhead_ms,
+                ))
+            } else {
+                Arc::new(TimeControl::none())
             }
+        };
+        if params.ponder {
+            tc.start_pondering();
         }
 
+        // Build SearchLimits.
+        let searchmoves: Vec<Move> = params
+            .searchmoves
+            .iter()
+            .filter_map(|s| Move::parse_uci(s))
+            .collect();
         let limits = SearchLimits {
-            depth,
-            movetime_ms,
-            infinite,
+            depth: params.depth,
+            nodes: params.nodes,
+            mate: params.mate,
+            infinite: params.infinite,
+            ponder: params.ponder,
+            multipv: self.options.multipv,
+            searchmoves,
         };
 
         // Bump TT generation for this search.
@@ -339,19 +339,24 @@ impl UciSession {
 
         // Spawn the search thread.
         let stop = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
         let stop_clone = Arc::clone(&stop);
+        let done_clone = Arc::clone(&done);
+        let tc_clone = Arc::clone(&tc);
         let pos_clone = self.position.clone();
         let out_clone = self.out.clone();
-        let tt_clone = std::sync::Arc::clone(&self.tt);
+        let tt_clone = Arc::clone(&self.tt);
 
         let thread = std::thread::spawn(move || {
             let mut pos = pos_clone;
             let limits = limits;
             let stop = stop_clone;
+            let done = done_clone;
+            let tc = tc_clone;
             let out = out_clone;
             let tt = tt_clone;
 
-            let result = crate::search::search(&mut pos, limits, &stop, &tt, &mut |event| {
+            let result = crate::search::search(&mut pos, limits, &stop, &tc, &tt, &mut |event| {
                 let score_str = if event.score.abs() >= MATE - MAX_PLY as i32 {
                     let mate_in = if event.score > 0 {
                         (MATE - event.score + 1) / 2
@@ -393,6 +398,14 @@ impl UciSession {
                 let _ = out.blocking_send(line);
             });
 
+            // Ponder park: if `go ponder` was requested, don't emit bestmove
+            // until `ponderhit` (or `stop`) arrives. While pondering we poll.
+            if tc.is_pondering() {
+                while tc.is_pondering() && !stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+
             let best_line = if let Some(mv) = result.best_move {
                 if result.pv.len() >= 2 {
                     format!("bestmove {} ponder {}", mv, result.pv[1])
@@ -403,9 +416,15 @@ impl UciSession {
                 "bestmove (none)".to_string()
             };
             let _ = out.blocking_send(best_line);
+            done.store(true, Ordering::Relaxed);
         });
 
-        self.search = Some(SearchHandle { thread, stop });
+        self.search = Some(SearchHandle {
+            thread,
+            stop,
+            tc,
+            done,
+        });
     }
 
     /// Push one line toward stdout via the writer task.
