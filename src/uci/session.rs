@@ -283,13 +283,6 @@ impl UciSession {
         // Reap any finished handle before spawning.
         self.reap_search_if_finished();
 
-        // Ponder warning stays until 6d fully implements the workflow;
-        // searchmoves/mate/nodes are now handled (6a/6b).
-        if params.ponder {
-            self.send("info string ponder not yet supported (Phase 6)")
-                .await;
-        }
-
         // Build TimeControl.
         let tc = if let Some(mt) = params.movetime {
             Arc::new(TimeControl::for_movetime(mt))
