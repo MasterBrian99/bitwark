@@ -301,6 +301,141 @@ pub fn search(
             }
         }
 
+        // MultiPV: for N>1 search each root move with a full window and
+        // report the N best lines (aspiration disabled — windows anchor on
+        // a single best score and don't transfer to the N-line case).
+        if ctx.limits.multipv > 1 {
+            let mut moves = Vec::new();
+            generate_legal(pos, &mut moves);
+            if !ctx.limits.searchmoves.is_empty() {
+                let original = moves.clone();
+                moves.retain(|m| ctx.limits.searchmoves.contains(m));
+                if moves.is_empty() {
+                    moves = original;
+                }
+            }
+            if moves.is_empty() {
+                break;
+            }
+            // For MultiPV we don't shuffle PV-first; full-window search per
+            // move makes ordering irrelevant for correctness.
+            let mut results: Vec<(i32, Move, Vec<Move>)> = Vec::new();
+            let mut aborted = false;
+            let mut last_curr_emit_ms: u64 = 0;
+            for (idx, &mv) in moves.iter().enumerate() {
+                // CurrMove throttle (always at depth 1, else 100ms).
+                {
+                    let now = ctx.tc.elapsed_ms();
+                    let do_emit = depth <= 1 || now.saturating_sub(last_curr_emit_ms) >= 100;
+                    if do_emit {
+                        last_curr_emit_ms = now;
+                        on_event(SearchEvent::CurrMove {
+                            depth: depth as u8,
+                            currmove: mv,
+                            number: idx + 1,
+                        });
+                    }
+                }
+                if stop.load(Ordering::Relaxed) {
+                    aborted = true;
+                    break;
+                }
+                if ctx.tc.should_hard_stop() {
+                    stop.store(true, Ordering::Relaxed);
+                    aborted = true;
+                    break;
+                }
+                if let Some(limit) = ctx.limits.nodes {
+                    if ctx.nodes >= limit {
+                        stop.store(true, Ordering::Relaxed);
+                        aborted = true;
+                        break;
+                    }
+                }
+                // Clear child PV before search so we can capture it.
+                ctx.pv_len[1] = 0;
+                pos.make_move(mv);
+                let score = -alpha_beta::negamax(
+                    pos,
+                    depth as i32 - 1,
+                    -VALUE_INFINITE,
+                    VALUE_INFINITE,
+                    1,
+                    true,
+                    &mut ctx,
+                );
+                pos.unmake_move(mv);
+                if stop.load(Ordering::Relaxed) {
+                    aborted = true;
+                    break;
+                }
+                // Build PV: mv + child line from ply 1.
+                let mut pv = Vec::new();
+                pv.push(mv);
+                let child_len = ctx.pv_len[1];
+                for j in 0..child_len {
+                    if let Some(m) = ctx.pv_table[1][j] {
+                        pv.push(m);
+                    }
+                }
+                results.push((score, mv, pv));
+            }
+            if aborted {
+                if stop.load(Ordering::Relaxed) && !best_pv.is_empty() {
+                    let elapsed = ctx.tc.elapsed_ms();
+                    let nps = if elapsed > 0 {
+                        ctx.nodes * 1000 / elapsed
+                    } else {
+                        ctx.nodes
+                    };
+                    on_event(SearchEvent::Iteration {
+                        depth: (depth as u8).saturating_sub(1),
+                        seldepth: ctx.seldepth,
+                        multipv: 1,
+                        score: best_score,
+                        bound: None,
+                        nodes: ctx.nodes,
+                        time_ms: elapsed,
+                        nps,
+                        hashfull: ctx.tt.hashfull_permille(),
+                        pv: best_pv.clone(),
+                    });
+                }
+                break;
+            }
+            // Sort descending by score (best first).
+            results.sort_by_key(|r| std::cmp::Reverse(r.0));
+            let k = (ctx.limits.multipv as usize).min(results.len());
+            // Update best from PV1.
+            best_move = results[0].1;
+            best_score = results[0].0;
+            best_pv = results[0].2.clone();
+            prev_score = best_score;
+            let elapsed = ctx.tc.elapsed_ms();
+            let nps = if elapsed > 0 {
+                ctx.nodes * 1000 / elapsed
+            } else {
+                ctx.nodes
+            };
+            last_iter_ms = elapsed;
+            // Emit N lines, multipv 1..k, same nodes/time/hashfull each.
+            for (idx, (score, _mv, pv)) in results.iter().enumerate().take(k) {
+                on_event(SearchEvent::Iteration {
+                    depth: depth as u8,
+                    seldepth: ctx.seldepth,
+                    multipv: (idx + 1) as u32,
+                    score: *score,
+                    bound: None,
+                    nodes: ctx.nodes,
+                    time_ms: elapsed,
+                    nps,
+                    hashfull: ctx.tt.hashfull_permille(),
+                    pv: pv.clone(),
+                });
+            }
+            continue;
+        }
+
         // Aspiration window (depth >=5 and not a mate score).
         let mut delta: i32 = 25;
         let mut alpha = -VALUE_INFINITE;
