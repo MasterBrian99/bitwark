@@ -7,6 +7,7 @@
 
 pub mod attacks;
 pub mod fen;
+pub mod movelist;
 pub mod movgen;
 pub mod mv;
 pub mod perft;
@@ -18,9 +19,10 @@ pub use attacks::{
     bishop_attacks, king_attacks, knight_attacks, pawn_attacks, queen_attacks, rook_attacks,
 };
 pub use fen::{FenError, START_FEN, parse_fen, to_fen};
+pub use movelist::{MAX_MOVES, MoveList};
 pub use movgen::{
-    count_legal, generate_captures, generate_legal, generate_pseudo_captures,
-    generate_pseudo_legal, is_square_attacked,
+    count_legal, generate_captures, generate_captures_into, generate_legal, generate_legal_into,
+    generate_pseudo_captures, generate_pseudo_legal, is_square_attacked,
 };
 pub use mv::Move;
 pub use perft::perft;

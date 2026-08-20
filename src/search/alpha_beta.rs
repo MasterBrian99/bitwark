@@ -12,7 +12,12 @@
 use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
 
-use crate::board::{PieceType, Position, generate_legal, is_square_attacked};
+use crate::board::movelist::MoveList;
+use crate::board::types::Bitboard;
+use crate::board::{
+    Move, Piece, PieceType, Position, Square, generate_legal_into, is_square_attacked,
+};
+use crate::board::{bishop_attacks, knight_attacks, pawn_attacks, rook_attacks};
 
 use super::{MATE, MAX_PLY, SearchContext, quiescence::quiescence, tt::Bound};
 
@@ -32,7 +37,6 @@ fn lmr_reduction(depth: i32, move_idx: usize) -> i32 {
                 } else {
                     let d_f = d as f64;
                     let m_f = m as f64;
-                    // 0.77 + ln(d) * ln(m) / 2.36 — classic Tuned
                     let r = 0.77 + d_f.ln() * m_f.ln() / 2.36;
                     t[d][m] = (r as u8).min((d - 2) as u8);
                 }
@@ -47,14 +51,13 @@ fn lmr_reduction(depth: i32, move_idx: usize) -> i32 {
 
 #[inline]
 #[allow(clippy::collapsible_if)]
-fn is_quiet(pos: &Position, mv: crate::board::Move) -> bool {
+fn is_quiet(pos: &Position, mv: Move) -> bool {
     if mv.promotion.is_some() {
         return false;
     }
     if pos.piece_at(mv.to).is_some() {
         return false;
     }
-    // En passant capture
     if let Some(pc) = pos.piece_at(mv.from) {
         if pc.piece_type() == PieceType::Pawn && pos.en_passant() == Some(mv.to) {
             return false;
@@ -64,19 +67,85 @@ fn is_quiet(pos: &Position, mv: crate::board::Move) -> bool {
 }
 
 #[inline]
-fn gives_check(pos: &mut Position, mv: crate::board::Move) -> bool {
-    // Make the move, test if opponent king is attacked, unmake.
-    // This is called only for moves considered for LMR (quiet, beyond idx 3),
-    // so the extra make/unmake cost is tiny.
-    pos.make_move(mv);
-    let opp = pos.side_to_move();
-    let gives = if let Some(king_sq) = pos.king_square(opp) {
-        is_square_attacked(pos, king_sq, opp.opposite())
-    } else {
-        false
+fn gives_check(pos: &Position, mv: Move) -> bool {
+    // Bitboard gives-check without make/unmake: does the move attack the enemy king
+    // with its post-move occupancy? Covers direct and discovered.
+    let us = pos.side_to_move();
+    let them = us.opposite();
+    let ek = match pos.king_square(them) {
+        Some(s) => s,
+        None => return false,
     };
-    pos.unmake_move(mv);
-    gives
+    let moving = match pos.piece_at(mv.from) {
+        Some(p) => p,
+        None => return false,
+    };
+    let occ = pos.occupied();
+    let from_bb = Bitboard::from_sq(mv.from);
+    let to_bb = Bitboard::from_sq(mv.to);
+    let is_ep = moving.piece_type() == PieceType::Pawn && pos.en_passant() == Some(mv.to);
+    let occ_after = if is_ep {
+        let cap_sq = Square::from_coords(mv.to.file(), mv.from.rank());
+        let cap_bb = Bitboard::from_sq(cap_sq);
+        Bitboard((occ.0 ^ from_bb.0 ^ cap_bb.0) | to_bb.0)
+    } else {
+        Bitboard((occ.0 ^ from_bb.0) | to_bb.0)
+    };
+
+    // After bitboards for us attackers
+    let mut us_pawns = pos.pieces_bb(Piece::new(us, PieceType::Pawn));
+    let mut us_knights = pos.pieces_bb(Piece::new(us, PieceType::Knight));
+    let mut us_bishops = pos.pieces_bb(Piece::new(us, PieceType::Bishop));
+    let mut us_rooks = pos.pieces_bb(Piece::new(us, PieceType::Rook));
+    let mut us_queens = pos.pieces_bb(Piece::new(us, PieceType::Queen));
+
+    match moving.piece_type() {
+        PieceType::Pawn => {
+            us_pawns.0 &= !from_bb.0;
+            if let Some(promo) = mv.promotion {
+                match promo {
+                    PieceType::Queen => us_queens.0 |= to_bb.0,
+                    PieceType::Rook => us_rooks.0 |= to_bb.0,
+                    PieceType::Bishop => us_bishops.0 |= to_bb.0,
+                    PieceType::Knight => us_knights.0 |= to_bb.0,
+                    PieceType::Pawn | PieceType::King => {}
+                }
+            } else {
+                us_pawns.0 |= to_bb.0;
+            }
+        }
+        PieceType::Knight => {
+            us_knights.0 ^= from_bb.0 | to_bb.0;
+        }
+        PieceType::Bishop => {
+            us_bishops.0 ^= from_bb.0 | to_bb.0;
+        }
+        PieceType::Rook => {
+            us_rooks.0 ^= from_bb.0 | to_bb.0;
+        }
+        PieceType::Queen => {
+            us_queens.0 ^= from_bb.0 | to_bb.0;
+        }
+        PieceType::King => {}
+    }
+
+    // Pawns attack
+    if (pawn_attacks(ek, them) & us_pawns).0 != 0 {
+        return true;
+    }
+    if (knight_attacks(ek) & us_knights).0 != 0 {
+        return true;
+    }
+    // King cannot give check by moving adjacent (illegal), but discovered via other piece still counts — handled by sliders below.
+    let bishops = us_bishops | us_queens;
+    if (bishop_attacks(ek, occ_after) & bishops).0 != 0 {
+        return true;
+    }
+    let rooks = us_rooks | us_queens;
+    if (rook_attacks(ek, occ_after) & rooks).0 != 0 {
+        return true;
+    }
+    false
 }
 
 /// Negamax alpha-beta.
@@ -94,12 +163,7 @@ pub fn negamax(
 ) -> i32 {
     let is_pv = beta > alpha + 1;
 
-    // Abort if stop flag set.
     if ctx.stop.load(Ordering::Relaxed) {
-        return 0;
-    }
-    if ctx.tc.should_hard_stop() {
-        ctx.stop.store(true, Ordering::Relaxed);
         return 0;
     }
     if ctx.nodes.is_multiple_of(2048) && ctx.tc.should_hard_stop() {
@@ -122,27 +186,20 @@ pub fn negamax(
         ctx.seldepth = ply;
     }
 
-    // Draw by 50-move or repetition — searched as 0 (no contempt).
     if pos.is_repetition() || pos.is_fifty_move_draw() {
         return 0;
     }
 
-    // Mate distance pruning (cheap, safe).
-    // If we are already mated in ply, alpha/beta bound the mate score.
     let mated = -MATE + ply as i32;
-    let mate = MATE - ply as i32 - 1;
+    // let mate = MATE - ply as i32 - 1; // beta capping is safe but not needed (exclusive bound)
     if alpha < mated {
         alpha = mated;
-    }
-    if beta > mate {
-        // beta is exclusive upper bound, but capping is safe.
     }
     if alpha >= beta {
         return alpha;
     }
 
-    // TT probe.
-    let mut tt_move: Option<crate::board::Move> = None;
+    let mut tt_move: Option<Move> = None;
     if let Some(hit) = ctx.tt.probe(pos.hash(), ply) {
         tt_move = hit.mv;
         if (hit.depth as i32) >= depth {
@@ -155,7 +212,6 @@ pub fn negamax(
         }
     }
 
-    // In-check extension (before leaf check so checks are never qsearched).
     let in_check = if let Some(king_sq) = pos.king_square(pos.side_to_move()) {
         is_square_attacked(pos, king_sq, pos.side_to_move().opposite())
     } else {
@@ -165,18 +221,12 @@ pub fn negamax(
         depth += 1;
     }
 
-    // Leaf: go to quiescence (only when not in check — checks were extended).
     if depth <= 0 {
         return quiescence(pos, alpha, beta, ply, ctx);
     }
 
     let static_eval = crate::eval::evaluate(pos);
 
-    // Futility pruning / Razoring style: at very low depth and not in check,
-    // if eval is far below alpha, return eval (fail-soft). We implement this
-    // as per-move quiet skipping below, which is safer for tactics. The node-level
-    // razoring shortcut is optional and skipped to keep mate puzzles intact.
-    // Null-move pruning (non-PV, not in check, depth >= 3, eval >= beta).
     if !is_pv
         && !in_check
         && can_null
@@ -191,70 +241,49 @@ pub fn negamax(
         if ctx.stop.load(Ordering::Relaxed) {
             return 0;
         }
-        // Don't return unproven mate scores.
         if score >= beta && score.abs() < MATE - MAX_PLY as i32 {
             return beta;
         }
     }
 
-    // Generate legal moves.
-    let mut moves = Vec::new();
-    generate_legal(pos, &mut moves);
+    // Generate legal moves into stack MoveList
+    let mut list = MoveList::new();
+    generate_legal_into(pos, &mut list);
 
-    if moves.is_empty() {
+    if list.is_empty() {
         if in_check {
             return -MATE + ply as i32;
         }
         return 0;
     }
 
+    // Pre-score once (O(n) instead of O(n²))
+    crate::search::order::score_list(
+        pos,
+        &mut list,
+        tt_move,
+        &ctx.killers[ply],
+        &ctx.history,
+        ply,
+    );
+
     ctx.pv_len[ply] = 0;
 
     let mut best_score = -MATE * 2;
     let original_alpha = alpha;
-    let mut best_move: Option<crate::board::Move> = None;
+    let mut best_move: Option<Move> = None;
     let mut quiet_tried = 0usize;
 
-    for i in 0..moves.len() {
-        // Pick best remaining move.
-        let best_idx = {
-            let mut best = i;
-            let mut best_s = crate::search::order::score_move(
-                pos,
-                moves[i],
-                tt_move,
-                &ctx.killers[ply],
-                &ctx.history,
-                ply,
-            );
-            for j in (i + 1)..moves.len() {
-                let s = crate::search::order::score_move(
-                    pos,
-                    moves[j],
-                    tt_move,
-                    &ctx.killers[ply],
-                    &ctx.history,
-                    ply,
-                );
-                if s > best_s {
-                    best_s = s;
-                    best = j;
-                }
-            }
-            best
-        };
-        moves.swap(i, best_idx);
-        let mv = moves[i];
+    let list_len = list.len;
+    for i in 0..list_len {
+        let mv = list.pick_best(i);
 
         let quiet = is_quiet(pos, mv);
 
-        // Futility & LMP skips for quiet moves (captures always searched).
         if !is_pv && !in_check && quiet {
-            // Futility: skip quiets that are very unlikely to raise alpha.
             if depth <= 6 && static_eval + 120 * depth <= alpha {
                 continue;
             }
-            // Late move pruning: skip late quiets at shallow depth.
             if depth <= 4 && quiet_tried >= 3 + (depth as usize * depth as usize) {
                 continue;
             }
@@ -267,7 +296,6 @@ pub fn negamax(
             return 0;
         }
 
-        // LMR: reduce quiet non-check-giving moves beyond the first few.
         let mut reduction = 0;
         if !is_pv && !in_check && quiet && depth >= 3 && i >= 3 && !gives_check(pos, mv) {
             reduction = lmr_reduction(depth, i);
@@ -278,7 +306,6 @@ pub fn negamax(
         }
 
         let score = if reduction > 0 {
-            // Reduced zero-window search.
             pos.make_move(mv);
             let v = -negamax(
                 pos,
@@ -294,7 +321,6 @@ pub fn negamax(
                 return 0;
             }
             if v > alpha {
-                // Re-search at full depth, zero-window.
                 pos.make_move(mv);
                 let v2 = -negamax(pos, depth - 1, -alpha - 1, -alpha, ply + 1, true, ctx);
                 pos.unmake_move(mv);
@@ -324,7 +350,6 @@ pub fn negamax(
             }
             v
         } else {
-            // PVS zero-window.
             pos.make_move(mv);
             let v = -negamax(pos, depth - 1, -alpha - 1, -alpha, ply + 1, true, ctx);
             pos.unmake_move(mv);
@@ -359,7 +384,6 @@ pub fn negamax(
             ctx.pv_len[ply] = child_len + 1;
 
             if alpha >= beta {
-                // Beta cutoff: update killers/history if quiet.
                 if quiet {
                     crate::search::order::update_killers(&mut ctx.killers, ply, mv);
                     let side = pos.side_to_move();
@@ -392,5 +416,81 @@ pub fn negamax(
         alpha
     } else {
         best_score
+    }
+}
+
+#[cfg(test)]
+mod gives_check_tests {
+    use super::gives_check;
+    use crate::board::{Move, Position, generate_legal, is_square_attacked};
+
+    fn gives_check_slow(pos: &mut Position, mv: Move) -> bool {
+        pos.make_move(mv);
+        let opp = pos.side_to_move();
+        let gives = if let Some(king_sq) = pos.king_square(opp) {
+            is_square_attacked(pos, king_sq, opp.opposite())
+        } else {
+            false
+        };
+        pos.unmake_move(mv);
+        gives
+    }
+
+    #[test]
+    fn gives_check_matches_random() {
+        use crate::board::fen::parse_fen;
+        let fens = [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+            "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+            "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
+            "r1bq1rk1/pp2ppbp/2np1np1/2p5/2P1P3/1PN1B3/PB1Q1PPP/R3K2R w KQ - 0 1",
+        ];
+        for fen in fens {
+            let pos = parse_fen(fen).unwrap();
+            let mut moves = Vec::new();
+            generate_legal(&pos, &mut moves);
+            for mv in moves {
+                let fast = gives_check(&pos, mv);
+                let mut pos2 = pos.clone();
+                let slow = gives_check_slow(&mut pos2, mv);
+                assert_eq!(
+                    fast, slow,
+                    "mismatch fen {} mv {} fast {} slow {}",
+                    fen, mv, fast, slow
+                );
+            }
+        }
+        // random walk
+        let mut pos =
+            parse_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();
+        let mut rng: u64 = 0x9E3779B97F4A7C15;
+        for _ in 0..200 {
+            let mut moves = Vec::new();
+            generate_legal(&pos, &mut moves);
+            if moves.is_empty() {
+                break;
+            }
+            for mv in &moves {
+                let fast = gives_check(&pos, *mv);
+                let mut pos2 = pos.clone();
+                let slow = gives_check_slow(&mut pos2, *mv);
+                assert_eq!(
+                    fast,
+                    slow,
+                    "walk mismatch pos {} mv {} fast {} slow {}",
+                    crate::board::fen::to_fen(&pos),
+                    mv,
+                    fast,
+                    slow
+                );
+            }
+            // pick pseudo random move
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let idx = (rng as usize) % moves.len();
+            pos.make_move(moves[idx]);
+            // small chance to undo? keep walk.
+        }
     }
 }

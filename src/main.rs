@@ -1,3 +1,5 @@
+#![allow(clippy::unnecessary_mut_passed)]
+#![allow(clippy::collapsible_if)]
 //! Bitwark — a classical chess engine speaking UCI.
 //!
 //! Process architecture (the async skeleton everything else hangs on):

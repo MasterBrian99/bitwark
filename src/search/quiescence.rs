@@ -8,7 +8,8 @@
 
 use std::sync::atomic::Ordering;
 
-use crate::board::{Position, generate_captures};
+use crate::board::movelist::MoveList;
+use crate::board::{Position, generate_captures_into};
 use crate::eval::evaluate;
 
 use super::{MAX_PLY, SearchContext};
@@ -25,15 +26,9 @@ pub fn quiescence(
     ply: usize,
     ctx: &mut SearchContext,
 ) -> i32 {
-    // Stop check — cheap, done every node.
     if ctx.stop.load(Ordering::Relaxed) {
         return 0;
     }
-    if ctx.tc.should_hard_stop() {
-        ctx.stop.store(true, Ordering::Relaxed);
-        return 0;
-    }
-    // Time check every 2048 nodes (amortised).
     if ctx.nodes.is_multiple_of(2048) && ctx.tc.should_hard_stop() {
         ctx.stop.store(true, Ordering::Relaxed);
         return 0;
@@ -54,8 +49,6 @@ pub fn quiescence(
         ctx.seldepth = ply;
     }
 
-    // Draw detection — if this position is already drawn, don't stand pat
-    // higher than 0.
     if pos.is_repetition() || pos.is_fifty_move_draw() {
         return 0;
     }
@@ -69,39 +62,27 @@ pub fn quiescence(
         alpha = stand_pat;
     }
 
-    // Generate only captures and promotions.
-    let mut moves = Vec::new();
-    generate_captures(pos, &mut moves);
+    let mut list = MoveList::new();
+    generate_captures_into(pos, &mut list);
 
-    // Order captures by MVV-LVA.
-    // We reuse the full ordering via pick-best incremental to allow early cutoffs.
-    // For simplicity in quiescence (usually <10 moves), sorting once is fine.
-    if moves.is_empty() {
+    if list.is_empty() {
         return alpha;
     }
 
-    // Score and sort descending — small list, full sort is cheap and simple.
-    {
-        let mut scored: Vec<(i32, crate::board::Move)> = moves
-            .into_iter()
-            .map(|mv| (crate::search::order::score_move_simple(pos, mv), mv))
-            .collect();
-        scored.sort_by_key(|b| std::cmp::Reverse(b.0));
-        moves = scored.into_iter().map(|(_, mv)| mv).collect();
-    }
+    // Score captures by MVV-LVA (history/killers irrelevant in qsearch)
+    let dummy_killers = [None, None];
+    let dummy_history = [[[0; 64]; 64]; 2];
+    crate::search::order::score_list(pos, &mut list, None, &dummy_killers, &dummy_history, ply);
 
-    // PV handling in quiescence is optional; we maintain length for seldepth
-    // but don't store full PV (wastes time). Keep it simple: no PV update.
-    // Root PV comes from main search's PV table; qsearch nodes just improve
-    // the score that propagates to the PV node.
-    // However, to keep PV table consistent, clear this ply's PV length.
     ctx.pv_len[ply] = 0;
 
-    for mv in moves {
-        // Make move and check stop quickly.
+    let len = list.len;
+    for i in 0..len {
         if ctx.stop.load(Ordering::Relaxed) {
             return 0;
         }
+
+        let mv = list.pick_best(i);
 
         pos.make_move(mv);
         let score = -quiescence(pos, -beta, -alpha, ply + 1, ctx);

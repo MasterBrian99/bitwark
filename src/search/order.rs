@@ -4,6 +4,7 @@
 //! Higher is searched first. See chessprogramming.org "Move Ordering",
 //! "MVV-LVA", "Killer Heuristic", "History Heuristic".
 
+use crate::board::movelist::MoveList;
 use crate::board::types::Color;
 use crate::board::{Move, PieceType, Position};
 
@@ -89,10 +90,26 @@ pub fn score_move(
 /// Backwards-compatible scorer for qsearch/captures-only callers.
 /// TT move is `None`, killers empty, history zeroed — captures scored by MVV-LVA,
 /// quiets 0.
+#[allow(dead_code)]
 pub fn score_move_simple(pos: &Position, mv: Move) -> i32 {
     let dummy_killers = [None, None];
     let dummy_history = [[[0; 64]; 64]; 2];
     score_move(pos, mv, None, &dummy_killers, &dummy_history, 0)
+}
+
+/// Bulk-score a MoveList into its parallel `scores` array (one pass, O(n)).
+#[inline]
+pub fn score_list(
+    pos: &Position,
+    list: &mut MoveList,
+    tt_move: Option<Move>,
+    killers: &[Option<Move>; 2],
+    history: &[[[i32; 64]; 64]; 2],
+    ply: usize,
+) {
+    for i in 0..list.len {
+        list.scores[i] = score_move(pos, list.moves[i], tt_move, killers, history, ply);
+    }
 }
 
 /// Update killers on a quiet beta cutoff.
