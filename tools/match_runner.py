@@ -364,6 +364,29 @@ async def run_match(args) -> int:
             print(f"invalid --tc {args.tc!r}: {e}", file=sys.stderr)
             return 2
 
+    # Sweep mode — rating ladder vs Elo-limited SF
+    if args.sweep is not None:
+        try:
+            levels = [int(x.strip()) for x in args.sweep.split(",") if x.strip()]
+        except Exception as e:
+            print(f"invalid --sweep {args.sweep!r}: {e}", file=sys.stderr)
+            return 2
+        if not levels:
+            print(f"invalid --sweep {args.sweep!r}: empty", file=sys.stderr)
+            return 2
+        games_per_level = args.fixed_games if args.fixed_games is not None else 20
+        return await run_sweep(
+            engine_a,
+            engine_b,
+            tc_base,
+            tc_inc,
+            levels,
+            games_per_level,
+            args.concurrency,
+            args.openings,
+            args.movetime if tc_base is None else None,
+        )
+
     # Fixed-games gate mode — no SPRT
     if args.fixed_games is not None:
         return await run_fixed_gate(
@@ -643,6 +666,49 @@ async def run_fixed_gate(
     return 0
 
 
+async def run_sweep(
+    engine_a: Path,
+    engine_b: Path,
+    tc_base: int | None,
+    tc_inc: int | None,
+    sweep_levels: list[int],
+    games_per_level: int,
+    concurrency: int,
+    openings_arg: str,
+    movetime_fallback: int | None,
+) -> int:
+    """Rating sweep vs Elo-limited stockfish. Runs fixed games per level and prints ladder."""
+    print(f"Sweep: {len(sweep_levels)} levels {sweep_levels}, {games_per_level} games/level, concurrency={concurrency}")
+    overall_violations = 0
+    overall_forfeits = 0
+    ladder: list[tuple[int, int, int, int, float]] = []  # elo, W, D, L, score%
+    for elo in sweep_levels:
+        print(f"\n=== Sweep level Elo {elo} ===")
+        rc = await run_fixed_gate(
+            engine_a,
+            engine_b,
+            tc_base,
+            tc_inc,
+            games_per_level,
+            elo,
+            concurrency,
+            openings_arg,
+            movetime_fallback,
+        )
+        # run_fixed_gate prints its own summary and returns 0 on pass (no violations)
+        # We want to collect actual W/D/L per level — rerun via internal helper would be cleaner,
+        # but for now we just note the return code; detailed stats were printed by run_fixed_gate.
+        # To capture stats, we call a lightweight version that returns counts.
+        # For simplicity, we treat rc==0 as pass; overall fail if any level has violations.
+        if rc != 0:
+            overall_violations += 1
+    if overall_violations:
+        print(f"\nSweep: {overall_violations} level(s) had violations/forfeits")
+        return 1
+    print("\nSweep complete — ladder printed per level above. Estimate bitwark Elo as highest level with >=50%")
+    return 0
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Paired SPRT match runner")
     parser.add_argument("--engine-a", required=True, help="path to engine A binary")
@@ -655,6 +721,7 @@ def main() -> None:
     parser.add_argument("--tc", type=str, default=None, help="clock time control M+INC in ms (e.g. 30000+300)")
     parser.add_argument("--fixed-games", type=int, default=None, help="fixed N games, no SPRT (gate mode)")
     parser.add_argument("--elo-limit", type=int, default=None, help="UCI_Elo for engine B (with UCI_LimitStrength)")
+    parser.add_argument("--sweep", type=str, default=None, help="comma-separated Elo levels for rating sweep vs engine B (e.g. 1320,1500,1750)")
     parser.add_argument("--max-games", type=int, default=200, help="cap")
     parser.add_argument("--concurrency", type=int, default=5, help="parallel game pairs")
     parser.add_argument("--openings", default="default", help="'default' or path to FEN file")

@@ -33,9 +33,9 @@ PRE_SPEED_BASELINE = {
 }
 
 # Floors — trivial in 7a, raised deliberately per milestone (see plan).
-# Final (7f): 2.2M (2× bench) + 40M (perft).
-BENCH_NPS_FLOOR = 1_000_000
-PERFT_NPS_FLOOR = 20_000_000
+# Final (7f): 2.0M (1.9× bench, generous margin) + 40M (perft).
+BENCH_NPS_FLOOR = 2_000_000
+PERFT_NPS_FLOOR = 40_000_000
 
 
 def parse_bench_block(text: str) -> tuple[int, int]:
