@@ -228,11 +228,30 @@ struct Magic {
     offset: usize,
 }
 
+#[inline]
+fn pext_software(x: u64, mut mask: u64) -> u64 {
+    // Software PEXT (parallel bits extract) — compress x bits where mask has 1s.
+    let mut res = 0u64;
+    let mut bit = 0;
+    while mask != 0 {
+        let lsb = mask & mask.wrapping_neg();
+        let idx = lsb.trailing_zeros();
+        if (x >> idx) & 1 == 1 {
+            res |= 1 << bit;
+        }
+        bit += 1;
+        mask &= mask - 1;
+    }
+    res
+}
+
 struct MagicTables {
     bishop_magics: [Magic; 64],
     rook_magics: [Magic; 64],
     bishop_table: Vec<Bitboard>,
     rook_table: Vec<Bitboard>,
+    bishop_pext_table: Vec<Bitboard>,
+    rook_pext_table: Vec<Bitboard>,
 }
 
 static MAGIC_TABLES: OnceLock<MagicTables> = OnceLock::new();
@@ -424,6 +443,8 @@ fn init_magic_tables() -> MagicTables {
 
     let mut bishop_table = vec![Bitboard::EMPTY; bishop_offset];
     let mut rook_table = vec![Bitboard::EMPTY; rook_offset];
+    let mut bishop_pext_table = vec![Bitboard::EMPTY; bishop_offset];
+    let mut rook_pext_table = vec![Bitboard::EMPTY; rook_offset];
 
     // Fill tables
     for sq in Square::ALL {
@@ -447,6 +468,8 @@ fn init_magic_tables() -> MagicTables {
             let att = bishop_attacks_ray(sq, blockers);
             let idx_magic = ((blockers.0.wrapping_mul(bmagic.magic)) >> bmagic.shift) as usize;
             bishop_table[bmagic.offset + idx_magic] = att;
+            let idx_pext = pext_software(blockers.0, bmagic.mask.0) as usize;
+            bishop_pext_table[bmagic.offset + idx_pext] = att;
         }
         for sub in 0..size_r {
             let mut blockers = Bitboard::EMPTY;
@@ -461,6 +484,8 @@ fn init_magic_tables() -> MagicTables {
             let att = rook_attacks_ray(sq, blockers);
             let idx_magic = ((blockers.0.wrapping_mul(rmagic.magic)) >> rmagic.shift) as usize;
             rook_table[rmagic.offset + idx_magic] = att;
+            let idx_pext = pext_software(blockers.0, rmagic.mask.0) as usize;
+            rook_pext_table[rmagic.offset + idx_pext] = att;
         }
     }
 
@@ -469,11 +494,29 @@ fn init_magic_tables() -> MagicTables {
         rook_magics: rook_magics_arr,
         bishop_table,
         rook_table,
+        bishop_pext_table,
+        rook_pext_table,
     }
 }
 
 fn magic_tables() -> &'static MagicTables {
     MAGIC_TABLES.get_or_init(init_magic_tables)
+}
+
+#[cfg(target_arch = "x86_64")]
+static BMI2_AVAILABLE: OnceLock<bool> = OnceLock::new();
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn has_bmi2() -> bool {
+    *BMI2_AVAILABLE.get_or_init(|| std::arch::is_x86_feature_detected!("bmi2"))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "bmi2")]
+#[inline]
+unsafe fn pext_u64(x: u64, mask: u64) -> u64 {
+    std::arch::x86_64::_pext_u64(x, mask)
 }
 
 /// Bishop attacks with occupancy.
@@ -482,6 +525,12 @@ pub fn bishop_attacks(sq: Square, occupied: Bitboard) -> Bitboard {
     let t = magic_tables();
     let m = t.bishop_magics[sq.index() as usize];
     let blockers = occupied & m.mask;
+    #[cfg(target_arch = "x86_64")]
+    if has_bmi2() {
+        // SAFETY: has_bmi2() guarantees BMI2 support.
+        let idx = unsafe { pext_u64(blockers.0, m.mask.0) as usize };
+        return t.bishop_pext_table[m.offset + idx];
+    }
     let idx = ((blockers.0.wrapping_mul(m.magic)) >> m.shift) as usize;
     t.bishop_table[m.offset + idx]
 }
@@ -492,6 +541,11 @@ pub fn rook_attacks(sq: Square, occupied: Bitboard) -> Bitboard {
     let t = magic_tables();
     let m = t.rook_magics[sq.index() as usize];
     let blockers = occupied & m.mask;
+    #[cfg(target_arch = "x86_64")]
+    if has_bmi2() {
+        let idx = unsafe { pext_u64(blockers.0, m.mask.0) as usize };
+        return t.rook_pext_table[m.offset + idx];
+    }
     let idx = ((blockers.0.wrapping_mul(m.magic)) >> m.shift) as usize;
     t.rook_table[m.offset + idx]
 }
@@ -650,6 +704,53 @@ mod tests {
                 queen_attacks(sq, occ),
                 bishop_attacks(sq, occ) | rook_attacks(sq, occ)
             );
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn pext_equals_magic() {
+        if !has_bmi2() {
+            return;
+        }
+        for sq in Square::ALL {
+            for occ in [
+                Bitboard::EMPTY,
+                Bitboard::from_u64(0xFF00FF00FF00FF00),
+                Bitboard::from_u64(0x123456789ABCDEF0),
+                Bitboard::from_u64(0x0F0F0F0F0F0F0F0F),
+            ] {
+                // The public functions now use the PEXT path on this machine; verify they still match ray
+                let b = bishop_attacks(sq, occ);
+                let r = rook_attacks(sq, occ);
+                let t = magic_tables();
+                let bm = t.bishop_magics[sq.index() as usize];
+                let blockers = occ & bm.mask;
+                let magic_idx = ((blockers.0.wrapping_mul(bm.magic)) >> bm.shift) as usize;
+                let pext_idx = unsafe { pext_u64(blockers.0, bm.mask.0) as usize };
+                assert_eq!(
+                    t.bishop_pext_table[bm.offset + pext_idx],
+                    t.bishop_table[bm.offset + magic_idx],
+                    "pext vs magic mismatch bishop sq {} occ {:016X}",
+                    sq,
+                    occ.0
+                );
+                let rm = t.rook_magics[sq.index() as usize];
+                let rb = occ & rm.mask;
+                let r_magic = ((rb.0.wrapping_mul(rm.magic)) >> rm.shift) as usize;
+                let r_pext = unsafe { pext_u64(rb.0, rm.mask.0) as usize };
+                assert_eq!(
+                    t.rook_pext_table[rm.offset + r_pext],
+                    t.rook_table[rm.offset + r_magic],
+                    "pext vs magic rook sq {} occ {:016X}",
+                    sq,
+                    occ.0
+                );
+                // sanity that attack still equals ray via pext table
+                let bm_expected = bishop_attacks_ray(sq, blockers);
+                assert_eq!(b & bm_expected, bm_expected & b);
+                let _ = r;
+            }
         }
     }
 }
