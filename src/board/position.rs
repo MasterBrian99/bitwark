@@ -13,6 +13,7 @@
 use crate::board::mv::Move;
 use crate::board::types::{Bitboard, Color, Piece, PieceType, Square};
 use crate::board::zobrist;
+use crate::eval::tables;
 
 // ---------------------------------------------------------------------------
 // Castling constants
@@ -24,6 +25,40 @@ pub const CASTLE_BK: u8 = 4; // k
 pub const CASTLE_BQ: u8 = 8; // q
 pub const CASTLE_ALL: u8 = CASTLE_WK | CASTLE_WQ | CASTLE_BK | CASTLE_BQ;
 
+#[inline]
+fn psqt_delta(p: Piece, sq: Square) -> (i32, i32) {
+    let idx = sq.index() as usize;
+    let pst_idx = if p.color() == Color::White {
+        idx
+    } else {
+        idx ^ 56
+    };
+    let pt = p.piece_type() as usize;
+    let mg_pst = match p.piece_type() {
+        PieceType::Pawn => tables::MG_PAWN_TABLE[pst_idx],
+        PieceType::Knight => tables::MG_KNIGHT_TABLE[pst_idx],
+        PieceType::Bishop => tables::MG_BISHOP_TABLE[pst_idx],
+        PieceType::Rook => tables::MG_ROOK_TABLE[pst_idx],
+        PieceType::Queen => tables::MG_QUEEN_TABLE[pst_idx],
+        PieceType::King => tables::MG_KING_TABLE[pst_idx],
+    };
+    let eg_pst = match p.piece_type() {
+        PieceType::Pawn => tables::EG_PAWN_TABLE[pst_idx],
+        PieceType::Knight => tables::EG_KNIGHT_TABLE[pst_idx],
+        PieceType::Bishop => tables::EG_BISHOP_TABLE[pst_idx],
+        PieceType::Rook => tables::EG_ROOK_TABLE[pst_idx],
+        PieceType::Queen => tables::EG_QUEEN_TABLE[pst_idx],
+        PieceType::King => tables::EG_KING_TABLE[pst_idx],
+    };
+    let mg = tables::MG_VALUE[pt] + mg_pst;
+    let eg = tables::EG_VALUE[pt] + eg_pst;
+    if p.color() == Color::White {
+        (mg, eg)
+    } else {
+        (-mg, -eg)
+    }
+}
+
 /// Undo information for one ply — pushed onto `history` on `make_move`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct UndoInfo {
@@ -33,6 +68,9 @@ struct UndoInfo {
     en_passant: Option<Square>,
     halfmove: u8,
     hash: u64,
+    psqt_mg: i32,
+    psqt_eg: i32,
+    pawn_hash: u64,
 }
 
 /// A chess position. `Clone` so search can copy-make into its own position.
@@ -58,6 +96,11 @@ pub struct Position {
     fullmove: u16,
     /// Zobrist hash (updated incrementally by make/unmake).
     hash: u64,
+    /// Incremental PSQT (material+PST) — white minus black, MG/EG.
+    psqt_mg: i32,
+    psqt_eg: i32,
+    /// Pawn structure hash (XOR of pawn piece-square keys only).
+    pawn_hash: u64,
     /// History stack for unmake.
     history: Vec<UndoInfo>,
 }
@@ -76,6 +119,9 @@ impl Position {
             halfmove: 0,
             fullmove: 1,
             hash: 0,
+            psqt_mg: 0,
+            psqt_eg: 0,
+            pawn_hash: 0,
             history: Vec::new(),
         }
     }
@@ -95,13 +141,20 @@ impl Position {
     /// Place or remove a piece on `sq`. Keeps all three representations in sync.
     fn set_piece(&mut self, sq: Square, piece: Option<Piece>) {
         let idx = sq.index() as usize;
+        let old = self.board[idx];
         // Remove old piece if any.
-        if let Some(old) = self.board[idx] {
+        if let Some(old_p) = old {
             let bb = Bitboard::from_sq(sq);
-            self.pieces[old.index()] = Bitboard(self.pieces[old.index()].0 & !bb.0);
-            self.occupancy[old.color().as_usize()] =
-                Bitboard(self.occupancy[old.color().as_usize()].0 & !bb.0);
+            self.pieces[old_p.index()] = Bitboard(self.pieces[old_p.index()].0 & !bb.0);
+            self.occupancy[old_p.color().as_usize()] =
+                Bitboard(self.occupancy[old_p.color().as_usize()].0 & !bb.0);
             self.occupied = Bitboard(self.occupied.0 & !bb.0);
+            let (dm, de) = psqt_delta(old_p, sq);
+            self.psqt_mg -= dm;
+            self.psqt_eg -= de;
+            if old_p.piece_type() == PieceType::Pawn {
+                self.pawn_hash ^= zobrist::keys().piece_sq[old_p.index()][idx];
+            }
         }
         // Place new piece if any.
         if let Some(p) = piece {
@@ -110,6 +163,12 @@ impl Position {
             self.occupancy[p.color().as_usize()] =
                 Bitboard(self.occupancy[p.color().as_usize()].0 | bb.0);
             self.occupied = Bitboard(self.occupied.0 | bb.0);
+            let (dm, de) = psqt_delta(p, sq);
+            self.psqt_mg += dm;
+            self.psqt_eg += de;
+            if p.piece_type() == PieceType::Pawn {
+                self.pawn_hash ^= zobrist::keys().piece_sq[p.index()][idx];
+            }
         }
         self.board[idx] = piece;
     }
@@ -162,6 +221,21 @@ impl Position {
     #[inline]
     pub fn hash(&self) -> u64 {
         self.hash
+    }
+
+    #[inline]
+    pub fn psqt_mg(&self) -> i32 {
+        self.psqt_mg
+    }
+
+    #[inline]
+    pub fn psqt_eg(&self) -> i32 {
+        self.psqt_eg
+    }
+
+    #[inline]
+    pub fn pawn_hash(&self) -> u64 {
+        self.pawn_hash
     }
 
     #[inline]
@@ -227,6 +301,9 @@ impl Position {
             en_passant: self.en_passant,
             halfmove: self.halfmove,
             hash: self.hash,
+            psqt_mg: self.psqt_mg,
+            psqt_eg: self.psqt_eg,
+            pawn_hash: self.pawn_hash,
         };
         let old_hash = undo.hash;
         let old_en_passant = undo.en_passant;
@@ -546,6 +623,9 @@ impl Position {
         self.en_passant = undo.en_passant;
         self.halfmove = undo.halfmove;
         self.hash = undo.hash;
+        self.psqt_mg = undo.psqt_mg;
+        self.psqt_eg = undo.psqt_eg;
+        self.pawn_hash = undo.pawn_hash;
     }
 
     // -----------------------------------------------------------------------
@@ -659,6 +739,9 @@ impl Position {
             en_passant: self.en_passant,
             halfmove: self.halfmove,
             hash: self.hash,
+            psqt_mg: self.psqt_mg,
+            psqt_eg: self.psqt_eg,
+            pawn_hash: self.pawn_hash,
         };
         let old_hash = self.hash;
         let old_ep = self.en_passant;
@@ -693,6 +776,9 @@ impl Position {
         self.halfmove = undo.halfmove;
         self.hash = undo.hash;
         self.castling = undo.castling;
+        self.psqt_mg = undo.psqt_mg;
+        self.psqt_eg = undo.psqt_eg;
+        self.pawn_hash = undo.pawn_hash;
     }
 
     /// Flip side to move without touching history (debug `flip` command, UCI spec §5.7).
@@ -738,8 +824,21 @@ impl Position {
     }
 
     pub(crate) fn rebuild_from_board(&mut self) {
-        // Already maintained via `set_piece`; just recompute hash.
         self.recompute_hash();
+        // Recompute incremental PSQT and pawn hash from scratch for consistency.
+        self.psqt_mg = 0;
+        self.psqt_eg = 0;
+        self.pawn_hash = 0;
+        for sq in Square::ALL {
+            if let Some(p) = self.board[sq.index() as usize] {
+                let (dm, de) = psqt_delta(p, sq);
+                self.psqt_mg += dm;
+                self.psqt_eg += de;
+                if p.piece_type() == PieceType::Pawn {
+                    self.pawn_hash ^= zobrist::keys().piece_sq[p.index()][sq.index() as usize];
+                }
+            }
+        }
     }
 
     pub(crate) fn place_piece_for_fen(&mut self, sq: Square, piece: Piece) {
@@ -881,5 +980,74 @@ mod tests {
         );
         pos.unmake_move(mv);
         assert_eq!(crate::board::fen::to_fen(&pos), fen);
+    }
+
+    #[test]
+    fn psqt_incremental_matches() {
+        fn recompute(pos: &Position) -> (i32, i32, u64) {
+            let mut mg = 0;
+            let mut eg = 0;
+            let mut ph = 0u64;
+            for sq in Square::ALL {
+                if let Some(p) = pos.piece_at(sq) {
+                    let (dm, de) = psqt_delta(p, sq);
+                    mg += dm;
+                    eg += de;
+                    if p.piece_type() == PieceType::Pawn {
+                        ph ^=
+                            crate::board::zobrist::keys().piece_sq[p.index()][sq.index() as usize];
+                    }
+                }
+            }
+            (mg, eg, ph)
+        }
+        let mut pos = Position::startpos();
+        let (em, ee, eph) = recompute(&pos);
+        assert_eq!(pos.psqt_mg(), em);
+        assert_eq!(pos.psqt_eg(), ee);
+        assert_eq!(pos.pawn_hash(), eph);
+        let moves = [
+            "e2e4", "e7e5", "g1f3", "b8c6", "f1b5", "a7a6", "b5a4", "g8f6",
+        ];
+        for mv_str in moves {
+            let mv = crate::board::mv::Move::parse_uci(mv_str).unwrap();
+            pos.make_move(mv);
+            let (em2, ee2, eph2) = recompute(&pos);
+            assert_eq!(pos.psqt_mg(), em2, "psqt mg after {}", mv_str);
+            assert_eq!(pos.psqt_eg(), ee2);
+            assert_eq!(pos.pawn_hash(), eph2);
+        }
+        for mv_str in moves.iter().rev() {
+            let mv = crate::board::mv::Move::parse_uci(mv_str).unwrap();
+            pos.unmake_move(mv);
+            let (em3, ee3, eph3) = recompute(&pos);
+            assert_eq!(pos.psqt_mg(), em3);
+            assert_eq!(pos.psqt_eg(), ee3);
+            assert_eq!(pos.pawn_hash(), eph3);
+        }
+        // eval incremental vs breakdown for a couple FENs
+        for fen in [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+        ] {
+            let p = parse_fen(fen).unwrap();
+            let inc = crate::eval::evaluate(&p);
+            let bd = crate::eval::breakdown(&p);
+            let base = bd.white_score();
+            let tempo = crate::eval::TEMPO_BONUS_MG * bd.phase / 24;
+            let white = base
+                + if p.side_to_move() == Color::White {
+                    tempo
+                } else {
+                    -tempo
+                };
+            let bd_eval = if p.side_to_move() == Color::White {
+                white
+            } else {
+                -white
+            };
+            assert_eq!(inc, bd_eval, "eval mismatch fen {}", fen);
+        }
     }
 }

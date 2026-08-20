@@ -178,7 +178,7 @@ pub fn negamax(
     }
 
     if ply >= MAX_PLY - 1 {
-        return crate::eval::evaluate(pos);
+        return crate::eval::evaluate_cached(pos, &mut ctx.pawn_cache);
     }
 
     ctx.nodes += 1;
@@ -225,7 +225,7 @@ pub fn negamax(
         return quiescence(pos, alpha, beta, ply, ctx);
     }
 
-    let static_eval = crate::eval::evaluate(pos);
+    let static_eval = crate::eval::evaluate_cached(pos, &mut ctx.pawn_cache);
 
     if !is_pv
         && !in_check

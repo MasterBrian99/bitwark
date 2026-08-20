@@ -31,6 +31,59 @@ pub mod pawns;
 pub mod pieces;
 pub mod tables;
 
+/// Pawn structure cache — direct-mapped, keyed by pawn_hash.
+/// Pure function cache: a miss recomputes, a collision overwrites.
+#[derive(Clone, Copy, Debug)]
+struct PawnEntry {
+    key: u64,
+    mg: i32,
+    eg: i32,
+}
+
+pub struct PawnCache {
+    entries: Vec<PawnEntry>,
+    mask: usize,
+}
+
+impl PawnCache {
+    pub fn new() -> Self {
+        let size = 1 << 14; // 16384 entries × ~16 bytes = 256 KiB
+        Self {
+            entries: vec![
+                PawnEntry {
+                    key: 0,
+                    mg: 0,
+                    eg: 0
+                };
+                size
+            ],
+            mask: size - 1,
+        }
+    }
+
+    #[inline]
+    pub fn probe(&self, key: u64) -> Option<(i32, i32)> {
+        let e = &self.entries[(key as usize) & self.mask];
+        if e.key == key {
+            Some((e.mg, e.eg))
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub fn store(&mut self, key: u64, mg: i32, eg: i32) {
+        let idx = (key as usize) & self.mask;
+        self.entries[idx] = PawnEntry { key, mg, eg };
+    }
+}
+
+impl Default for PawnCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Term breakdown — the single source of truth for both search and `eval`
 // ---------------------------------------------------------------------------
@@ -219,12 +272,45 @@ pub fn breakdown(pos: &Position) -> EvalBreakdown {
 ///
 /// Positive → good for the player to move (negamax convention). Uses the
 /// tapered MG/EG total plus a small tempo bonus scaled by phase.
+/// This is the incremental path: PSQT is read from `pos.psqt_*` (maintained
+/// via `set_piece`), pawn structure is computed directly (no cache).
 pub fn evaluate(pos: &Position) -> i32 {
-    let bd = breakdown(pos);
-    let base_white = bd.white_score();
-    // Tempo scaled by phase: ~TEMPO_BONUS_MG in middlegame, 0 in endgame.
-    let tempo_scaled = TEMPO_BONUS_MG * bd.phase / 24;
-    let white_pov = base_white
+    evaluate_with_pawn(pos, None)
+}
+
+/// Evaluate with pawn-hash cache (search hot path).
+pub fn evaluate_cached(pos: &Position, cache: &mut PawnCache) -> i32 {
+    evaluate_with_pawn(pos, Some(cache))
+}
+
+fn evaluate_with_pawn(pos: &Position, cache: Option<&mut PawnCache>) -> i32 {
+    let phase = game_phase(pos);
+    let psqt_mg = pos.psqt_mg();
+    let psqt_eg = pos.psqt_eg();
+
+    let (pawn_mg, pawn_eg) = if let Some(c) = cache {
+        if let Some((mg, eg)) = c.probe(pos.pawn_hash()) {
+            (mg, eg)
+        } else {
+            let (mg, eg) = pawns::eval(pos);
+            c.store(pos.pawn_hash(), mg, eg);
+            (mg, eg)
+        }
+    } else {
+        pawns::eval(pos)
+    };
+
+    let (mob_mg, mob_eg) = pieces::mobility(pos);
+    let (rook_mg, rook_eg) = pieces::rook_files(pos);
+    let (bp_mg, bp_eg) = pieces::bishop_pair(pos);
+    let (king_mg, king_eg) = king::eval(pos);
+
+    let mg = psqt_mg + pawn_mg + mob_mg + rook_mg + bp_mg + king_mg;
+    let eg = psqt_eg + pawn_eg + mob_eg + rook_eg + bp_eg + king_eg;
+    let white_score = (mg * phase + eg * (24 - phase)) / 24;
+
+    let tempo_scaled = TEMPO_BONUS_MG * phase / 24;
+    let white_pov = white_score
         + if pos.side_to_move() == Color::White {
             tempo_scaled
         } else {

@@ -10,7 +10,7 @@ use std::sync::atomic::Ordering;
 
 use crate::board::movelist::MoveList;
 use crate::board::{Position, generate_captures_into};
-use crate::eval::evaluate;
+use crate::eval::evaluate_cached;
 
 use super::{MAX_PLY, SearchContext};
 
@@ -41,7 +41,7 @@ pub fn quiescence(
     }
 
     if ply >= MAX_PLY - 1 {
-        return evaluate(pos);
+        return evaluate_cached(pos, &mut ctx.pawn_cache);
     }
 
     ctx.nodes += 1;
@@ -53,7 +53,7 @@ pub fn quiescence(
         return 0;
     }
 
-    let stand_pat = evaluate(pos);
+    let stand_pat = evaluate_cached(pos, &mut ctx.pawn_cache);
 
     if stand_pat >= beta {
         return beta;

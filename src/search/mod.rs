@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::board::{Move, Position, generate_legal, is_square_attacked};
+use crate::eval::PawnCache;
 
 pub mod alpha_beta;
 pub mod order;
@@ -170,6 +171,8 @@ pub struct SearchContext<'a> {
     /// History: side × from × to, gravity with cap ±16384.
     #[allow(dead_code)]
     pub history: Box<[[[i32; 64]; 64]; 2]>,
+    /// Pawn structure cache (direct-mapped).
+    pub pawn_cache: PawnCache,
 }
 
 impl<'a> SearchContext<'a> {
@@ -190,6 +193,7 @@ impl<'a> SearchContext<'a> {
             tt,
             killers: [[None; 2]; MAX_PLY],
             history: Box::new([[[0; 64]; 64]; 2]),
+            pawn_cache: PawnCache::new(),
         }
     }
 }
