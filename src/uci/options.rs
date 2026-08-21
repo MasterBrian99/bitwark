@@ -14,7 +14,7 @@
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct EngineOptions {
-    /// Search threads (Lazy SMP). Consumed in Phase 8; locked to 1 until then.
+    /// Search threads (Lazy SMP).
     pub threads: u32,
     /// Transposition-table size, MiB.
     pub hash_mib: u32,

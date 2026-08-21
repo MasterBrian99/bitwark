@@ -279,6 +279,7 @@ fn filtered_root_moves(pos: &Position, searchmoves: &[Move]) -> Vec<Move> {
 ///
 /// This is the single-thread compat entry used by tests. Production `go`
 /// and `bench` go through `worker::search` (which adds SMP).
+#[allow(dead_code)]
 pub fn search(
     pos: &mut Position,
     limits: SearchLimits,

@@ -330,6 +330,21 @@ impl UciSession {
         // Bump TT generation for this search.
         self.tt.new_search();
 
+        // Threads for this `go` — captured at go time.
+        let threads = self.options.threads;
+        if threads > 1 {
+            if let Ok(cpus) = std::thread::available_parallelism() {
+                if threads as usize > cpus.get() {
+                    self.send(&format!(
+                        "info string note: Threads {} exceeds available parallelism {} — oversubscription may reduce NPS",
+                        threads,
+                        cpus.get()
+                    ))
+                    .await;
+                }
+            }
+        }
+
         // Spawn the search thread.
         let stop = Arc::new(AtomicBool::new(false));
         let done = Arc::new(AtomicBool::new(false));
@@ -341,7 +356,7 @@ impl UciSession {
         let tt_clone = Arc::clone(&self.tt);
 
         let thread = std::thread::spawn(move || {
-            let mut pos = pos_clone;
+            let pos = pos_clone;
             let limits = limits;
             let stop = stop_clone;
             let done = done_clone;
@@ -349,60 +364,70 @@ impl UciSession {
             let out = out_clone;
             let tt = tt_clone;
 
-            let result = crate::search::search(&mut pos, limits, &stop, &tc, &tt, &mut |event| {
-                let line = match event {
-                    crate::search::SearchEvent::Iteration {
-                        depth,
-                        seldepth,
-                        multipv,
-                        score,
-                        bound,
-                        nodes,
-                        time_ms,
-                        nps,
-                        hashfull,
-                        pv,
-                    } => {
-                        let score_base = if score.abs() >= MATE - MAX_PLY as i32 {
-                            let mate_in = if score > 0 {
-                                (MATE - score + 1) / 2
+            let result = crate::search::worker::search(
+                &pos,
+                limits,
+                &stop,
+                &tc,
+                &tt,
+                threads,
+                &mut |event| {
+                    let line = match event {
+                        crate::search::SearchEvent::Iteration {
+                            depth,
+                            seldepth,
+                            multipv,
+                            score,
+                            bound,
+                            nodes,
+                            time_ms,
+                            nps,
+                            hashfull,
+                            pv,
+                        } => {
+                            let score_base = if score.abs() >= MATE - MAX_PLY as i32 {
+                                let mate_in = if score > 0 {
+                                    (MATE - score + 1) / 2
+                                } else {
+                                    -((MATE + score + 1) / 2)
+                                };
+                                format!("mate {mate_in}")
                             } else {
-                                -((MATE + score + 1) / 2)
+                                format!("cp {score}")
                             };
-                            format!("mate {mate_in}")
-                        } else {
-                            format!("cp {score}")
-                        };
-                        let bound_suffix = match bound {
-                            Some(crate::search::tt::Bound::Lower) => " lowerbound",
-                            Some(crate::search::tt::Bound::Upper) => " upperbound",
-                            _ => "",
-                        };
-                        let pv_str = pv
-                            .iter()
-                            .map(|m| m.to_string())
-                            .collect::<Vec<_>>()
-                            .join(" ");
-                        if pv_str.is_empty() {
+                            let bound_suffix = match bound {
+                                Some(crate::search::tt::Bound::Lower) => " lowerbound",
+                                Some(crate::search::tt::Bound::Upper) => " upperbound",
+                                _ => "",
+                            };
+                            let pv_str = pv
+                                .iter()
+                                .map(|m| m.to_string())
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            if pv_str.is_empty() {
+                                format!(
+                                    "info depth {depth} seldepth {seldepth} multipv {multipv} score {score_base}{bound_suffix} nodes {nodes} nps {nps} hashfull {hashfull} time {time_ms}"
+                                )
+                            } else {
+                                format!(
+                                    "info depth {depth} seldepth {seldepth} multipv {multipv} score {score_base}{bound_suffix} nodes {nodes} nps {nps} hashfull {hashfull} time {time_ms} pv {pv_str}"
+                                )
+                            }
+                        }
+                        crate::search::SearchEvent::CurrMove {
+                            depth,
+                            currmove,
+                            number,
+                        } => {
                             format!(
-                                "info depth {depth} seldepth {seldepth} multipv {multipv} score {score_base}{bound_suffix} nodes {nodes} nps {nps} hashfull {hashfull} time {time_ms}"
-                            )
-                        } else {
-                            format!(
-                                "info depth {depth} seldepth {seldepth} multipv {multipv} score {score_base}{bound_suffix} nodes {nodes} nps {nps} hashfull {hashfull} time {time_ms} pv {pv_str}"
+                                "info depth {depth} currmove {currmove} currmovenumber {number}"
                             )
                         }
-                    }
-                    crate::search::SearchEvent::CurrMove {
-                        depth,
-                        currmove,
-                        number,
-                    } => {
-                        format!("info depth {depth} currmove {currmove} currmovenumber {number}")
-                    }
-                };
-                let _ = out.blocking_send(line);
-            });
+                    };
+                    let _ = out.blocking_send(line);
+                },
+            );
 
             // Ponder park: if `go ponder` was requested, don't emit bestmove
             // until `ponderhit` (or `stop`) arrives. While pondering we poll.

@@ -57,7 +57,9 @@ pub struct BenchStats {
 /// Run the bench suite.
 ///
 /// * `tt_mib` — TT size in MiB.
-/// * `threads` — ignored this phase (>1 prints a warning).
+/// * `threads` — number of search threads (Lazy SMP). `1` is deterministic;
+///   `>1` is honored but `Nodes searched` becomes nondeterministic due to TT
+///   races (the gate only asserts determinism at threads=1).
 /// * `limit` — numeric limit (depth for `limit_type == "depth"`).
 /// * `fen_file` — `"default"`, `"current"`, or a path to a file with one FEN per line.
 /// * `limit_type` — `"depth"` (deterministic) or others (accepted for convenience).
@@ -68,10 +70,6 @@ pub fn run_bench(
     fen_file: &str,
     limit_type: &str,
 ) -> BenchStats {
-    if threads > 1 {
-        eprintln!("info string bench: threads>1 ignored until Phase 8 (Lazy SMP)");
-    }
-
     // Resolve FENs.
     let fens: Vec<String> = match fen_file {
         "default" => DEFAULT_FENS.iter().map(|s| s.to_string()).collect(),
@@ -136,7 +134,7 @@ pub fn run_bench(
     let mut total_nodes: u64 = 0;
 
     for fen in &fens {
-        let mut pos = match parse_fen(fen) {
+        let pos = match parse_fen(fen) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("bench: skipping invalid FEN '{fen}': {e}");
@@ -157,10 +155,18 @@ pub fn run_bench(
         // Generation bump once per position (matches the old per-search bump
         // inside `search()`; keeps the single-thread bench signature identical).
         tt.new_search();
-        // Run search; nodes are accumulated via ctx.nodes, returned in result.
-        let result = crate::search::search(&mut pos, limits, &stop, &tc, &tt, &mut |_event| {
-            // Suppress per-iteration info — bench is quiet.
-        });
+        // Run search; nodes are accumulated in the global counter, returned in result.
+        let result = crate::search::worker::search(
+            &pos,
+            limits,
+            &stop,
+            &tc,
+            &tt,
+            threads as u32,
+            &mut |_event| {
+                // Suppress per-iteration info — bench is quiet.
+            },
+        );
         total_nodes += result.nodes;
     }
 

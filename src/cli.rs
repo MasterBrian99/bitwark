@@ -52,7 +52,7 @@ pub enum Commands {
         #[arg(default_value_t = 16)]
         tt_size: usize,
 
-        /// Number of search threads.
+        /// Number of search threads (1 = deterministic; >1 = Lazy SMP, nondeterministic node counts).
         #[arg(default_value_t = 1)]
         threads: usize,
 
