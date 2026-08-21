@@ -127,6 +127,36 @@ async def handshake_with_elo(engine: UciEngine, elo_limit: int | None, is_b: boo
         await engine.wait_for("readyok", timeout=2.0)
 
 
+async def handshake_with_options(
+    engine: UciEngine,
+    options: list[str] | None,
+    elo_limit: int | None = None,
+    is_b: bool = False,
+) -> None:
+    """Handshake plus optional per-engine setoptions (Name=Value strings).
+
+    If `options` is non-empty, each entry is sent as `setoption name {Name} value {Value}`
+    followed by an `isready` barrier. `elo_limit` is handled as before for engine B.
+    """
+    await engine.handshake()
+    opts = options or []
+    # Apply explicit options first
+    for opt in opts:
+        try:
+            name, value = parse_option_arg(opt)
+        except ValueError as e:
+            print(f"  WARNING: ignoring malformed --option {opt!r}: {e}", file=sys.stderr)
+            continue
+        await engine.send(f"setoption name {name} value {value}")
+    # Stockfish Elo-limit (engine B only, kept for --elo-limit compat)
+    if elo_limit is not None and is_b:
+        await engine.send("setoption name UCI_LimitStrength value true")
+        await engine.send(f"setoption name UCI_Elo value {elo_limit}")
+    if opts or (elo_limit is not None and is_b):
+        await engine.send("isready")
+        await engine.wait_for("readyok", timeout=2.0)
+
+
 async def play_single_game(
     white_bin: Path,
     black_bin: Path,
@@ -136,6 +166,9 @@ async def play_single_game(
     engine_a_path: Path | None = None,
     engine_b_path: Path | None = None,
     elo_limit: int | None = None,
+    options_a: list[str] | None = None,
+    options_b: list[str] | None = None,
+    white_is_a: bool | None = None,
 ) -> tuple[float, int]:
     """Play one game with white_bin as White, black_bin as Black.
 
@@ -144,9 +177,33 @@ async def play_single_game(
     and violations is the count of non-protocol lines from engine A (bitwark).
     """
     async with UciEngine(white_bin) as white_eng, UciEngine(black_bin) as black_eng:
-        # Handshakes (+ Elo-limit for engine B if requested)
-        await handshake_with_elo(white_eng, elo_limit, Path(white_bin) == Path(engine_b_path) if engine_b_path else False)
-        await handshake_with_elo(black_eng, elo_limit, Path(black_bin) == Path(engine_b_path) if engine_b_path else False)
+        # Handshakes (+ options and Elo-limit).
+        if white_is_a is not None:
+            # Role-based (self-match with same binary)
+            white_opts = options_a if white_is_a else options_b
+            black_opts = options_b if white_is_a else options_a
+            white_is_b = not white_is_a
+            black_is_b = white_is_a
+            await handshake_with_options(white_eng, white_opts, elo_limit, white_is_b)
+            await handshake_with_options(black_eng, black_opts, elo_limit, black_is_b)
+        elif options_a or options_b:
+            # Distinct binaries with explicit --option-a/b, infer role via path
+            if engine_a_path is not None and engine_b_path is not None:
+                w_is_a = Path(white_bin) == Path(engine_a_path)
+                w_opts = options_a if w_is_a else options_b
+                b_opts = options_b if w_is_a else options_a
+                w_is_b = Path(white_bin) == Path(engine_b_path) if engine_b_path else False
+                b_is_b = Path(black_bin) == Path(engine_b_path) if engine_b_path else False
+                await handshake_with_options(white_eng, w_opts, elo_limit, w_is_b)
+                await handshake_with_options(black_eng, b_opts, elo_limit, b_is_b)
+            else:
+                # Fallback: no engine_a/b paths, apply options to both? Just use elo path
+                await handshake_with_elo(white_eng, elo_limit, Path(white_bin) == Path(engine_b_path) if engine_b_path else False)
+                await handshake_with_elo(black_eng, elo_limit, Path(black_bin) == Path(engine_b_path) if engine_b_path else False)
+        else:
+            # No explicit options — old path (elo only)
+            await handshake_with_elo(white_eng, elo_limit, Path(white_bin) == Path(engine_b_path) if engine_b_path else False)
+            await handshake_with_elo(black_eng, elo_limit, Path(black_bin) == Path(engine_b_path) if engine_b_path else False)
 
         if opening_fen is not None:
             board = chess.Board(opening_fen)
@@ -231,6 +288,9 @@ async def play_single_game_clock(
     engine_b_path: Path,
     elo_limit: int | None,
     overhead: int = 10,
+    options_a: list[str] | None = None,
+    options_b: list[str] | None = None,
+    white_is_a: bool | None = None,
 ) -> tuple[float, int, int]:
     """Clock time control game (wtime/btime).
 
@@ -238,8 +298,24 @@ async def play_single_game_clock(
     violations = non-protocol lines from engine A, forfeits = 1 if time forfeit by either side.
     """
     async with UciEngine(white_bin) as white_eng, UciEngine(black_bin) as black_eng:
-        await handshake_with_elo(white_eng, elo_limit, Path(white_bin) == Path(engine_b_path))
-        await handshake_with_elo(black_eng, elo_limit, Path(black_bin) == Path(engine_b_path))
+        if white_is_a is not None:
+            w_opts = options_a if white_is_a else options_b
+            b_opts = options_b if white_is_a else options_a
+            w_is_b = not white_is_a
+            b_is_b = white_is_a
+            await handshake_with_options(white_eng, w_opts, elo_limit, w_is_b)
+            await handshake_with_options(black_eng, b_opts, elo_limit, b_is_b)
+        elif options_a or options_b:
+            w_is_a = Path(white_bin) == Path(engine_a_path)
+            w_opts = options_a if w_is_a else options_b
+            b_opts = options_b if w_is_a else options_a
+            w_is_b = Path(white_bin) == Path(engine_b_path)
+            b_is_b = Path(black_bin) == Path(engine_b_path)
+            await handshake_with_options(white_eng, w_opts, elo_limit, w_is_b)
+            await handshake_with_options(black_eng, b_opts, elo_limit, b_is_b)
+        else:
+            await handshake_with_elo(white_eng, elo_limit, Path(white_bin) == Path(engine_b_path))
+            await handshake_with_elo(black_eng, elo_limit, Path(black_bin) == Path(engine_b_path))
 
         if opening_fen is not None:
             board = chess.Board(opening_fen)
@@ -399,6 +475,8 @@ async def run_match(args) -> int:
             args.concurrency,
             args.openings,
             args.movetime if tc_base is None else None,
+            options_a=args.option_a,
+            options_b=args.option_b,
         )
 
     # SPRT mode (existing)
@@ -461,14 +539,16 @@ async def run_match(args) -> int:
         # Game 1: A white, B black
         if tc_base is not None:
             r1_white, v1, _ = await play_single_game_clock(
-                engine_a, engine_b, opening_fen, opening_moves, tc_base, tc_inc or 0, engine_a, engine_b, args.elo_limit
+                engine_a, engine_b, opening_fen, opening_moves, tc_base, tc_inc or 0, engine_a, engine_b, args.elo_limit,
+                options_a=args.option_a, options_b=args.option_b, white_is_a=True,
             )
             # v1 counted as violations from engine A perspective already
             if v1:
                 print(f"  WARNING: {v1} protocol violations by A in game {games+1}")
         else:
             r1_white, v1 = await play_single_game(
-                engine_a, engine_b, opening_fen, opening_moves, movetime, engine_a, engine_b, args.elo_limit
+                engine_a, engine_b, opening_fen, opening_moves, movetime, engine_a, engine_b, args.elo_limit,
+                options_a=args.option_a, options_b=args.option_b, white_is_a=True,
             )
         # Map to A perspective: A is White
         r1_A = r1_white
@@ -499,11 +579,13 @@ async def run_match(args) -> int:
         # Game 2: B white, A black (same opening, colors swapped)
         if tc_base is not None:
             r2_white, v2, _ = await play_single_game_clock(
-                engine_b, engine_a, opening_fen, opening_moves, tc_base, tc_inc or 0, engine_a, engine_b, args.elo_limit
+                engine_b, engine_a, opening_fen, opening_moves, tc_base, tc_inc or 0, engine_a, engine_b, args.elo_limit,
+                options_a=args.option_a, options_b=args.option_b, white_is_a=False,
             )
         else:
             r2_white, v2 = await play_single_game(
-                engine_b, engine_a, opening_fen, opening_moves, movetime, engine_a, engine_b, args.elo_limit
+                engine_b, engine_a, opening_fen, opening_moves, movetime, engine_a, engine_b, args.elo_limit,
+                options_a=args.option_a, options_b=args.option_b, white_is_a=False,
             )
         # A is Black, so invert (draw stays 0.5)
         if r2_white == 1.0:
@@ -555,6 +637,8 @@ async def run_fixed_gate(
     concurrency: int,
     openings_arg: str,
     movetime_fallback: int | None,
+    options_a: list[str] | None = None,
+    options_b: list[str] | None = None,
 ) -> int:
     """Run a fixed number of games with clock or movetime, with violation/forfeit detection.
 
@@ -563,6 +647,10 @@ async def run_fixed_gate(
     """
     print(f"Fixed gate: {fixed_games} games, tc={tc_base}+{tc_inc} movetime={movetime_fallback} elo-limit={elo_limit} concurrency={concurrency}")
     print(f" engines: A={engine_a} B={engine_b}")
+    if options_a:
+        print(f"  option-a: {options_a}")
+    if options_b:
+        print(f"  option-b: {options_b}")
 
     # Openings
     openings_norm: list[tuple[str | None, list[str]]] = []
@@ -608,22 +696,25 @@ async def run_fixed_gate(
     results: list[tuple[float, int, int, str]] = []  # (white result, violations, forfeits, status)
 
     async def run_one(idx: int, white_bin: Path, black_bin: Path, fen: str | None, moves: list[str]):
+        white_is_a = (idx % 2 == 0)  # specs are paired A-vs-B, B-vs-A
         async with sem:
             if tc_base is not None:
                 res_w, viol, forf = await play_single_game_clock(
-                    white_bin, black_bin, fen, moves, tc_base, tc_inc or 0, engine_a, engine_b, elo_limit
+                    white_bin, black_bin, fen, moves, tc_base, tc_inc or 0, engine_a, engine_b, elo_limit,
+                    options_a=options_a, options_b=options_b, white_is_a=white_is_a,
                 )
             else:
                 mt = movetime_fallback if movetime_fallback is not None else 100
                 res_w, viol = await play_single_game(
-                    white_bin, black_bin, fen, moves, mt, engine_a, engine_b, elo_limit
+                    white_bin, black_bin, fen, moves, mt, engine_a, engine_b, elo_limit,
+                    options_a=options_a, options_b=options_b, white_is_a=white_is_a,
                 )
                 forf = 0
                 # For movetime gate, check violations already, forfeits are timeout forfeits counted as result (already)
             # Check aliveness via result forfeits (play functions return forfeit as result)
             status = "OK" if viol == 0 and forf == 0 else f"viol={viol} forf={forf}"
-            white_name = "A" if white_bin == engine_a else "B"
-            black_name = "B" if white_bin == engine_a else "A"
+            white_name = "A" if white_is_a else "B"
+            black_name = "B" if white_is_a else "A"
             print(f" game {idx+1:2}/{fixed_games}: {white_name} vs {black_name} result {res_w} {status}")
             return (res_w, viol, forf, status)
 
@@ -633,12 +724,12 @@ async def run_fixed_gate(
 
     total_violations = sum(g[1] for g in gathered)
     total_forfeits = sum(g[2] for g in gathered)
-    # Count wins/losses from engine A perspective
+    # Count wins/losses from engine A perspective (pairing is A-vs-B, B-vs-A)
     wins = draws = losses = 0
     for idx, (res_w, _, _, _) in enumerate(gathered):
-        white_bin = specs[idx][0]
+        white_is_a = (idx % 2 == 0)
         # Map white result to A perspective
-        if white_bin == engine_a:
+        if white_is_a:
             res_a = res_w
         else:
             # white is B, so invert
@@ -709,6 +800,18 @@ async def run_sweep(
     return 0
 
 
+def parse_option_arg(s: str) -> tuple[str, str]:
+    """Parse Name=Value for --option-a/--option-b."""
+    if "=" not in s:
+        raise ValueError(f"expected Name=Value, got {s!r}")
+    name, value = s.split("=", 1)
+    name = name.strip()
+    value = value.strip()
+    if not name:
+        raise ValueError(f"empty option name in {s!r}")
+    return name, value
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Paired SPRT match runner")
     parser.add_argument("--engine-a", required=True, help="path to engine A binary")
@@ -725,6 +828,8 @@ def main() -> None:
     parser.add_argument("--max-games", type=int, default=200, help="cap")
     parser.add_argument("--concurrency", type=int, default=5, help="parallel game pairs")
     parser.add_argument("--openings", default="default", help="'default' or path to FEN file")
+    parser.add_argument("--option-a", action="append", default=None, help="setoption for engine A, Name=Value (repeatable, e.g. Threads=4)")
+    parser.add_argument("--option-b", action="append", default=None, help="setoption for engine B, Name=Value (repeatable)")
     args = parser.parse_args()
     rc = asyncio.run(run_match(args))
     sys.exit(rc)
