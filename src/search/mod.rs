@@ -5,19 +5,25 @@
 //! async runtime and talks to the search via an atomic stop flag and a
 //! channel for `info`/`bestmove` lines.
 //!
+//! Lazy SMP: a main worker plus N-1 helper threads share a
+//! single lock-free TT. Each worker owns its killers/history/pawn-cache/PV
+//! via `SearchContext`; the global node count is aggregated through a shared
+//! `AtomicU64` flushed at the existing 2048-node cadence.
+//!
 //! Architecture:
 //! ```text
-//! GUI ── go ─▶ UciSession::handle_go ── clone Position + limits ──▶ std::thread::spawn(search)
-//!                    │                                                     │ blocking_send via
-//!                    │ stop flag (Arc<AtomicBool>)                         │ tokio mpsc Sender
-//!                    └──────────────────── stop ───────────────────────────┘
+//! GUI ── go ─▶ UciSession::handle_go ──► worker::search(threads=N) ──┐
+//!                                    │  main worker (this thread)    │
+//!                                    │  helpers (N-1 OS threads)     │
+//!                                    │  shared: TT, stop, TimeControl│
+//!                                    └───────────────────────────────┘
 //! ```
 
 #![allow(clippy::collapsible_if)]
 #![allow(clippy::manual_checked_ops)]
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::board::{Move, Position, generate_legal, is_square_attacked};
 use crate::eval::PawnCache;
@@ -27,6 +33,7 @@ pub mod order;
 pub mod quiescence;
 pub mod time;
 pub mod tt;
+pub mod worker;
 
 use time::TimeControl;
 
@@ -173,14 +180,36 @@ pub struct SearchContext<'a> {
     pub history: Box<[[[i32; 64]; 64]; 2]>,
     /// Pawn structure cache (direct-mapped).
     pub pawn_cache: PawnCache,
+    /// Global node counter shared across SMP workers.
+    pub total_nodes: Arc<AtomicU64>,
+    /// Last flushed local node count (for delta flushing).
+    pub last_flush: u64,
+    /// Worker index (0 = main).
+    #[allow(dead_code)]
+    pub thread_id: usize,
+    /// Whether this worker should emit `SearchEvent`s.
+    pub is_main: bool,
 }
 
 impl<'a> SearchContext<'a> {
+    #[allow(dead_code)]
     pub fn new(
         stop: &'a AtomicBool,
         limits: SearchLimits,
         tc: Arc<TimeControl>,
         tt: Arc<tt::TranspositionTable>,
+    ) -> Self {
+        Self::new_with_nodes(stop, limits, tc, tt, Arc::new(AtomicU64::new(0)), 0, true)
+    }
+
+    pub fn new_with_nodes(
+        stop: &'a AtomicBool,
+        limits: SearchLimits,
+        tc: Arc<TimeControl>,
+        tt: Arc<tt::TranspositionTable>,
+        total_nodes: Arc<AtomicU64>,
+        thread_id: usize,
+        is_main: bool,
     ) -> Self {
         Self {
             nodes: 0,
@@ -194,12 +223,52 @@ impl<'a> SearchContext<'a> {
             killers: [[None; 2]; MAX_PLY],
             history: Box::new([[[0; 64]; 64]; 2]),
             pawn_cache: PawnCache::new(),
+            total_nodes,
+            last_flush: 0,
+            thread_id,
+            is_main,
         }
+    }
+
+    /// Flush local delta into the global counter.
+    #[inline]
+    pub fn flush_nodes(&mut self) {
+        let delta = self.nodes.wrapping_sub(self.last_flush);
+        if delta > 0 {
+            self.total_nodes.fetch_add(delta, Ordering::Relaxed);
+            self.last_flush = self.nodes;
+        }
+    }
+
+    /// Global total including unflushed local delta (for event reporting).
+    #[inline]
+    pub fn global_nodes(&self) -> u64 {
+        let unflushed = self.nodes.wrapping_sub(self.last_flush);
+        self.total_nodes
+            .load(Ordering::Relaxed)
+            .wrapping_add(unflushed)
     }
 }
 
 // ---------------------------------------------------------------------------
-// Public entry — iterative deepening
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn filtered_root_moves(pos: &Position, searchmoves: &[Move]) -> Vec<Move> {
+    let mut moves = Vec::new();
+    generate_legal(pos, &mut moves);
+    if !searchmoves.is_empty() {
+        let original = moves.clone();
+        moves.retain(|m| searchmoves.contains(m));
+        if moves.is_empty() {
+            moves = original;
+        }
+    }
+    moves
+}
+
+// ---------------------------------------------------------------------------
+// Public entry — iterative deepening (single-thread compat wrapper)
 // ---------------------------------------------------------------------------
 
 /// Run iterative deepening on `pos` until a limit or `stop`.
@@ -207,6 +276,9 @@ impl<'a> SearchContext<'a> {
 /// Calls `on_event` once per completed depth.  Returns the best move found
 /// (or `None` if the root has no legal moves).  The position is left
 /// unmodified (all make/unmake balanced).
+///
+/// This is the single-thread compat entry used by tests. Production `go`
+/// and `bench` go through `worker::search` (which adds SMP).
 pub fn search(
     pos: &mut Position,
     limits: SearchLimits,
@@ -215,24 +287,46 @@ pub fn search(
     tt: &Arc<tt::TranspositionTable>,
     on_event: &mut dyn FnMut(SearchEvent),
 ) -> SearchResult {
-    let max_depth = limits.max_depth(tc);
-    tt.new_search();
-    let mut ctx = SearchContext::new(stop, limits.clone(), Arc::clone(tc), Arc::clone(tt));
+    let total = Arc::new(AtomicU64::new(0));
+    search_single(pos, limits, stop, tc, tt, &total, 0, true, 1, on_event)
+}
 
-    // Root legal moves — filtered by searchmoves if present (Phase 6b), but
-    // 6a already stores the filtered list; fallback if intersection empty.
-    let mut root_moves = Vec::new();
-    generate_legal(pos, &mut root_moves);
-    if !ctx.limits.searchmoves.is_empty() {
-        let original = root_moves.clone();
-        root_moves.retain(|m| ctx.limits.searchmoves.contains(m));
-        if root_moves.is_empty() {
-            root_moves = original;
-        }
-        // Empty intersection → fall back to unrestricted (guaranteed legal move).
+/// Core iterative-deepening implementation, parameterized for SMP.
+///
+/// `thread_id` 0 is the main worker; `is_main` controls event emission.
+/// `start_depth` lets helpers begin at a deeper depth (the Lazy SMP depth offset).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn search_single(
+    pos: &mut Position,
+    limits: SearchLimits,
+    stop: &AtomicBool,
+    tc: &Arc<TimeControl>,
+    tt: &Arc<tt::TranspositionTable>,
+    total_nodes: &Arc<AtomicU64>,
+    thread_id: usize,
+    is_main: bool,
+    start_depth: u8,
+    on_event: &mut dyn FnMut(SearchEvent),
+) -> SearchResult {
+    let max_depth = limits.max_depth(tc);
+    let start_depth = (start_depth as usize).max(1).min(max_depth.max(1));
+    let mut ctx = SearchContext::new_with_nodes(
+        stop,
+        limits.clone(),
+        Arc::clone(tc),
+        Arc::clone(tt),
+        Arc::clone(total_nodes),
+        thread_id,
+        is_main,
+    );
+
+    // Helpers in MultiPV mode run single-PV (just fill TT).
+    if !is_main && ctx.limits.multipv > 1 {
+        ctx.limits.multipv = 1;
     }
+
+    let root_moves = filtered_root_moves(pos, &ctx.limits.searchmoves);
     if root_moves.is_empty() {
-        // Score the root position itself for the info line (mate/stalemate/draw).
         let score = if let Some(king_sq) = pos.king_square(pos.side_to_move()) {
             if is_square_attacked(pos, king_sq, pos.side_to_move().opposite()) {
                 -MATE
@@ -255,9 +349,10 @@ pub fn search(
     let mut best_pv: Vec<Move> = vec![best_move];
     let mut prev_score: i32 = 0;
     let mut last_iter_ms: u64 = 0;
+    let mut have_prev = false;
 
     // Iterative deepening with aspiration windows.
-    for depth in 1..=max_depth {
+    for depth in start_depth..=max_depth {
         if stop.load(Ordering::Relaxed) {
             break;
         }
@@ -265,16 +360,10 @@ pub fn search(
             stop.store(true, Ordering::Relaxed);
             break;
         }
-        // Soft limit: don't start a new iteration if we've used our optimum.
         if ctx.tc.should_soft_stop() {
             break;
         }
-        // Heuristic: don't start an iteration we expect not to finish.
-        // Last iteration's wall time is a good predictor; growth is ~2×.
-        // Only for clock-based TC (soft != hard); for exact movetime
-        // (soft == hard) we rely on the hard abort mid-iteration instead so
-        // we fully use the allocated time.
-        if depth > 1
+        if depth > start_depth
             && ctx.tc.hard_ms() > 0
             && ctx.tc.soft_ms() != ctx.tc.hard_ms()
             && last_iter_ms > 0
@@ -284,10 +373,7 @@ pub fn search(
                 break;
             }
         }
-        // Early mate stop: proven mate found and no explicit depth requested.
-        // Guarded so `go depth N` always completes to N (bench determinism +
-        // uci.md semantics) and pondering doesn't stop on mate (§2.8).
-        if depth > 1
+        if depth > start_depth
             && !ctx.limits.ponder
             && !ctx.limits.infinite
             && ctx.limits.depth.is_none()
@@ -297,38 +383,23 @@ pub fn search(
         {
             break;
         }
-        // Depth-mate limit: if searching for mate in N, stop once it's proven.
-        // (Checked after each iteration; nodes limit checked per-node in negamax.)
         if let Some(mate_n) = ctx.limits.mate {
             if prev_score >= MATE - 2 * mate_n as i32 {
                 break;
             }
         }
 
-        // MultiPV: for N>1 search each root move with a full window and
-        // report the N best lines (aspiration disabled — windows anchor on
-        // a single best score and don't transfer to the N-line case).
-        if ctx.limits.multipv > 1 {
-            let mut moves = Vec::new();
-            generate_legal(pos, &mut moves);
-            if !ctx.limits.searchmoves.is_empty() {
-                let original = moves.clone();
-                moves.retain(|m| ctx.limits.searchmoves.contains(m));
-                if moves.is_empty() {
-                    moves = original;
-                }
-            }
+        // MultiPV: only the main worker emits multiple lines.
+        if ctx.limits.multipv > 1 && is_main {
+            let moves = filtered_root_moves(pos, &ctx.limits.searchmoves);
             if moves.is_empty() {
                 break;
             }
-            // For MultiPV we don't shuffle PV-first; full-window search per
-            // move makes ordering irrelevant for correctness.
             let mut results: Vec<(i32, Move, Vec<Move>)> = Vec::new();
             let mut aborted = false;
             let mut last_curr_emit_ms: u64 = 0;
             for (idx, &mv) in moves.iter().enumerate() {
-                // CurrMove throttle (always at depth 1, else 100ms).
-                {
+                if is_main {
                     let now = ctx.tc.elapsed_ms();
                     let do_emit = depth <= 1 || now.saturating_sub(last_curr_emit_ms) >= 100;
                     if do_emit {
@@ -350,13 +421,13 @@ pub fn search(
                     break;
                 }
                 if let Some(limit) = ctx.limits.nodes {
-                    if ctx.nodes >= limit {
+                    let total = ctx.global_nodes();
+                    if total >= limit {
                         stop.store(true, Ordering::Relaxed);
                         aborted = true;
                         break;
                     }
                 }
-                // Clear child PV before search so we can capture it.
                 ctx.pv_len[1] = 0;
                 pos.make_move(mv);
                 let score = -alpha_beta::negamax(
@@ -373,7 +444,6 @@ pub fn search(
                     aborted = true;
                     break;
                 }
-                // Build PV: mv + child line from ply 1.
                 let mut pv = Vec::new();
                 pv.push(mv);
                 let child_len = ctx.pv_len[1];
@@ -385,12 +455,14 @@ pub fn search(
                 results.push((score, mv, pv));
             }
             if aborted {
-                if stop.load(Ordering::Relaxed) && !best_pv.is_empty() {
+                if stop.load(Ordering::Relaxed) && !best_pv.is_empty() && is_main {
+                    ctx.flush_nodes();
+                    let total = ctx.total_nodes.load(Ordering::Relaxed);
                     let elapsed = ctx.tc.elapsed_ms();
                     let nps = if elapsed > 0 {
-                        ctx.nodes * 1000 / elapsed
+                        total * 1000 / elapsed
                     } else {
-                        ctx.nodes
+                        total
                     };
                     on_event(SearchEvent::Iteration {
                         depth: (depth as u8).saturating_sub(1),
@@ -398,7 +470,7 @@ pub fn search(
                         multipv: 1,
                         score: best_score,
                         bound: None,
-                        nodes: ctx.nodes,
+                        nodes: total,
                         time_ms: elapsed,
                         nps,
                         hashfull: ctx.tt.hashfull_permille(),
@@ -407,36 +479,43 @@ pub fn search(
                 }
                 break;
             }
-            // Sort descending by score (best first).
             results.sort_by_key(|r| std::cmp::Reverse(r.0));
             let k = (ctx.limits.multipv as usize).min(results.len());
-            // Update best from PV1.
             best_move = results[0].1;
             best_score = results[0].0;
             best_pv = results[0].2.clone();
             prev_score = best_score;
+            have_prev = true;
+            ctx.flush_nodes();
+            let total = ctx.total_nodes.load(Ordering::Relaxed);
             let elapsed = ctx.tc.elapsed_ms();
             let nps = if elapsed > 0 {
-                ctx.nodes * 1000 / elapsed
+                total * 1000 / elapsed
             } else {
-                ctx.nodes
+                total
             };
             last_iter_ms = elapsed;
-            // Emit N lines, multipv 1..k, same nodes/time/hashfull each.
-            for (idx, (score, _mv, pv)) in results.iter().enumerate().take(k) {
-                on_event(SearchEvent::Iteration {
-                    depth: depth as u8,
-                    seldepth: ctx.seldepth,
-                    multipv: (idx + 1) as u32,
-                    score: *score,
-                    bound: None,
-                    nodes: ctx.nodes,
-                    time_ms: elapsed,
-                    nps,
-                    hashfull: ctx.tt.hashfull_permille(),
-                    pv: pv.clone(),
-                });
+            if is_main {
+                for (idx, (score, _mv, pv)) in results.iter().enumerate().take(k) {
+                    on_event(SearchEvent::Iteration {
+                        depth: depth as u8,
+                        seldepth: ctx.seldepth,
+                        multipv: (idx + 1) as u32,
+                        score: *score,
+                        bound: None,
+                        nodes: total,
+                        time_ms: elapsed,
+                        nps,
+                        hashfull: ctx.tt.hashfull_permille(),
+                        pv: pv.clone(),
+                    });
+                }
             }
+            continue;
+        } else if ctx.limits.multipv > 1 && !is_main {
+            // Helpers shouldn't be in MultiPV — they were forced to single-PV above,
+            // but if we reach here with multipv>1 and not main, skip the iteration.
+            // This branch is unreachable due to the force above, but keep for safety.
             continue;
         }
 
@@ -444,14 +523,12 @@ pub fn search(
         let mut delta: i32 = 25;
         let mut alpha = -VALUE_INFINITE;
         let mut beta = VALUE_INFINITE;
-        if depth >= 5 && prev_score.abs() < MATE - MAX_PLY as i32 {
+        if depth >= 5 && have_prev && prev_score.abs() < MATE - MAX_PLY as i32 {
             alpha = prev_score - delta;
             beta = prev_score + delta;
         }
 
         let mut iteration_best: Option<(Move, i32)> = None;
-        // Aspiration re-search loop. On fail-high/low emit a bound-flagged
-        // iteration event so GUIs see lowerbound/upperbound.
         loop {
             let res = root_search(pos, depth as i32, alpha, beta, &mut ctx, on_event);
             if stop.load(Ordering::Relaxed) {
@@ -461,13 +538,14 @@ pub fn search(
                 break;
             };
             if score <= alpha {
-                // Fail low — widen window downward; emit upperbound.
-                {
+                if is_main {
+                    ctx.flush_nodes();
+                    let total = ctx.total_nodes.load(Ordering::Relaxed);
                     let elapsed = ctx.tc.elapsed_ms();
                     let nps = if elapsed > 0 {
-                        ctx.nodes * 1000 / elapsed
+                        total * 1000 / elapsed
                     } else {
-                        ctx.nodes
+                        total
                     };
                     on_event(SearchEvent::Iteration {
                         depth: depth as u8,
@@ -475,7 +553,7 @@ pub fn search(
                         multipv: 1,
                         score,
                         bound: Some(tt::Bound::Upper),
-                        nodes: ctx.nodes,
+                        nodes: total,
                         time_ms: elapsed,
                         nps,
                         hashfull: ctx.tt.hashfull_permille(),
@@ -491,13 +569,14 @@ pub fn search(
                 }
                 continue;
             } else if score >= beta {
-                // Fail high — widen upward; emit lowerbound.
-                {
+                if is_main {
+                    ctx.flush_nodes();
+                    let total = ctx.total_nodes.load(Ordering::Relaxed);
                     let elapsed = ctx.tc.elapsed_ms();
                     let nps = if elapsed > 0 {
-                        ctx.nodes * 1000 / elapsed
+                        total * 1000 / elapsed
                     } else {
-                        ctx.nodes
+                        total
                     };
                     on_event(SearchEvent::Iteration {
                         depth: depth as u8,
@@ -505,7 +584,7 @@ pub fn search(
                         multipv: 1,
                         score,
                         bound: Some(tt::Bound::Lower),
-                        nodes: ctx.nodes,
+                        nodes: total,
                         time_ms: elapsed,
                         nps,
                         hashfull: ctx.tt.hashfull_permille(),
@@ -520,22 +599,22 @@ pub fn search(
                 }
                 continue;
             } else {
-                // Exact — inside window.
                 iteration_best = Some((mv, score));
                 prev_score = score;
+                have_prev = true;
                 break;
             }
         }
 
         if stop.load(Ordering::Relaxed) {
-            // Mid-iteration abort: emit final summary of last completed
-            // iteration (if any) per UCI spec §2.9 before breaking.
-            if !best_pv.is_empty() {
+            if !best_pv.is_empty() && is_main {
+                ctx.flush_nodes();
+                let total = ctx.total_nodes.load(Ordering::Relaxed);
                 let elapsed = ctx.tc.elapsed_ms();
                 let nps = if elapsed > 0 {
-                    ctx.nodes * 1000 / elapsed
+                    total * 1000 / elapsed
                 } else {
-                    ctx.nodes
+                    total
                 };
                 on_event(SearchEvent::Iteration {
                     depth: (depth as u8).saturating_sub(1),
@@ -543,7 +622,7 @@ pub fn search(
                     multipv: 1,
                     score: best_score,
                     bound: None,
-                    nodes: ctx.nodes,
+                    nodes: total,
                     time_ms: elapsed,
                     nps,
                     hashfull: ctx.tt.hashfull_permille(),
@@ -553,11 +632,9 @@ pub fn search(
             break;
         }
         let Some((mv, score)) = iteration_best else {
-            // Aspiration loop aborted or no result (stop) — keep previous best.
             continue;
         };
 
-        // Build PV for this iteration.
         let pv_len = ctx.pv_len[0];
         let mut pv = Vec::with_capacity(pv_len);
         for i in 0..pv_len {
@@ -573,36 +650,41 @@ pub fn search(
         best_score = score;
         best_pv = pv.clone();
 
+        ctx.flush_nodes();
+        let total = ctx.total_nodes.load(Ordering::Relaxed);
         let elapsed_ms = ctx.tc.elapsed_ms();
-        // For `none()` tc elapsed is 0; for nps fallback use 1ms grace so nps is finite.
         let nps = if elapsed_ms > 0 {
-            ctx.nodes * 1000 / elapsed_ms
+            total * 1000 / elapsed_ms
         } else {
-            ctx.nodes
+            total
         };
         last_iter_ms = elapsed_ms;
 
-        on_event(SearchEvent::Iteration {
-            depth: depth as u8,
-            seldepth: ctx.seldepth,
-            multipv: 1,
-            score,
-            bound: None,
-            nodes: ctx.nodes,
-            time_ms: elapsed_ms,
-            nps,
-            hashfull: ctx.tt.hashfull_permille(),
-            pv: pv.clone(),
-        });
+        if is_main {
+            on_event(SearchEvent::Iteration {
+                depth: depth as u8,
+                seldepth: ctx.seldepth,
+                multipv: 1,
+                score,
+                bound: None,
+                nodes: total,
+                time_ms: elapsed_ms,
+                nps,
+                hashfull: ctx.tt.hashfull_permille(),
+                pv: pv.clone(),
+            });
+        }
 
         let _ = best_score;
     }
 
-    // Final elapsed/nodes for result (not an event).
+    // Final flush so the global total is accurate.
+    ctx.flush_nodes();
+    let total = ctx.total_nodes.load(Ordering::Relaxed);
     SearchResult {
         best_move: Some(best_move),
         score: best_score,
-        nodes: ctx.nodes,
+        nodes: total,
         pv: best_pv,
     }
 }
@@ -621,16 +703,7 @@ fn root_search(
     ctx: &mut SearchContext,
     on_event: &mut dyn FnMut(SearchEvent),
 ) -> Option<(Move, i32)> {
-    let mut moves = Vec::new();
-    generate_legal(pos, &mut moves);
-    // Apply searchmoves filter if present (mirrors the ID prologue).
-    if !ctx.limits.searchmoves.is_empty() {
-        let original = moves.clone();
-        moves.retain(|m| ctx.limits.searchmoves.contains(m));
-        if moves.is_empty() {
-            moves = original;
-        }
-    }
+    let mut moves = filtered_root_moves(pos, &ctx.limits.searchmoves);
     if moves.is_empty() {
         return None;
     }
@@ -674,8 +747,8 @@ fn root_search(
         }
         let mv = moves[i];
 
-        // currmove / currmovenumber — UCI spec §3.4
-        {
+        // currmove / currmovenumber — UCI spec §3.4 (main only)
+        if ctx.is_main {
             let now = ctx.tc.elapsed_ms();
             let do_emit = depth <= 1 || now.saturating_sub(last_curr_emit_ms) >= 100;
             if do_emit {
@@ -695,13 +768,22 @@ fn root_search(
             ctx.stop.store(true, Ordering::Relaxed);
             return None;
         }
-        if ctx.nodes.is_multiple_of(2048) && ctx.tc.should_hard_stop() {
-            ctx.stop.store(true, Ordering::Relaxed);
-            return None;
-        }
-        // Nodes limit (approximate; checked every node because it's a plain u64).
-        if let Some(limit) = ctx.limits.nodes {
-            if ctx.nodes >= limit {
+        // Periodic flush + checks at root per-move (also handled inside negamax).
+        if ctx.nodes.is_multiple_of(2048) {
+            ctx.flush_nodes();
+            if ctx.tc.should_hard_stop() {
+                ctx.stop.store(true, Ordering::Relaxed);
+                return None;
+            }
+            if let Some(limit) = ctx.limits.nodes {
+                if ctx.total_nodes.load(Ordering::Relaxed) >= limit {
+                    ctx.stop.store(true, Ordering::Relaxed);
+                    return None;
+                }
+            }
+        } else if let Some(limit) = ctx.limits.nodes {
+            // Also check total periodically even without flush (other threads may have filled it).
+            if ctx.total_nodes.load(Ordering::Relaxed) >= limit {
                 ctx.stop.store(true, Ordering::Relaxed);
                 return None;
             }
@@ -739,8 +821,6 @@ fn root_search(
             }
             ctx.pv_len[0] = child_len + 1;
         }
-        // No early cutoff at root — need best among all moves.
-        // Keep original alpha for fail-low detection (ID loop checks).
         let _ = orig_alpha;
     }
 
@@ -773,22 +853,11 @@ mod tests {
 
     #[test]
     fn mate_in_1_found() {
-        // White to move and mate in 1: Qh7# (or Qg7# etc). Simple.
-        // Position: white queen and king vs black king on back rank with mate threat.
-        // From known puzzle: "7k/5Q2/6K1/8/8/8/8/8 w - - 0 1" — Qg7# or Qh7#?
-        // Use a classic mate-in-1: "r1bqkbnr/ppp2Qpp/2n5/4p3/2B1P3/8/PPPP1PPP/RNB1K1NR b KQkq - 0 4"
-        // Not robust. Use trivial forced mate: white to move, black king h8, white queen g7, white king g6?
-        // Let's use: "7k/6Q1/5K2/8/8/8/8/8 w - - 0 1" — Qh7#? Queen on g7, king on f6, black king h8.
-        // Actually "6k1/5Q2/6K1/8/8/8/8/8 w - - 0 1" — Qg7#? Check.
-        // Simpler: use Stockfish mate-in-1: "r1bqkb1r/pppp1ppp/2n2n2/4p2Q/2B1P3/8/PPPP1PPP/RNB1K1NR w KQkq - 1 3"
-        // White Qh5xf7#
         let fen = "r1bqkb1r/pppp1ppp/2n2n2/4p2Q/2B1P3/8/PPPP1PPP/RNB1K1NR w KQkq - 1 3";
         let res = search_depth(fen, 2);
         let mv_str = res.best_move.unwrap().to_string();
-        // Any mating move is okay, but Qxf7 is the classic — at least the move must give checkmate.
         let mut pos = parse_fen(fen).unwrap();
         pos.make_move(res.best_move.unwrap());
-        // Verify checkmate: no legal moves and in check for opponent.
         let mut moves = Vec::new();
         crate::board::generate_legal(&mut pos, &mut moves);
         assert!(
@@ -808,21 +877,8 @@ mod tests {
 
     #[test]
     fn mate_in_2_found() {
-        // Classic smothered mate-ish: we'll test that search finds mate in 2 at depth 4.
-        // Position: white to move, forced mate in 2: use a known puzzle.
-        // Example: "5rk1/5ppp/8/8/8/8/5PPP/4R1K1 w - - 0 1" not good.
-        // Use a simple puzzle from chessprogramming: "r2qk2r/pb4pp/1n2Pb2/2B2Q2/p1p5/2P5/P3N1PP/R3K2R w KQkq - 0 1"
-        // Instead use a trivial mate-in-2 that our shallow search can solve without extensions.
-        // Position after 1. Qxf7+ Kxf7 2. etc? Let's pick a proven one:
-        // "6k1/5ppp/8/8/8/8/5PPP/6K1 w - - 0 1" is not mate in 2.
-        // Use: "3Q4/5pk1/5p1p/6p1/8/6PP/5PK1/8 w - - 0 1" — mate in 2 (Qg7+).
-        // Simpler: start with mate-in-2 we know: "k7/8/1K6/8/8/8/8/7Q w - - 0 1"  Qb7# is mate in 1 actually.
-        // Let's brute: pick "r2q1rk1/pp2ppbp/2np1np1/2p5/2P1P3/1PN1B3/PB1Q1PPP/R3K2R w KQ - 0 1" not guaranteed.
-        // For robustness we test that at depth 4 we find a move that forces mate by checking via search's own score magnitude.
-        // If score is mate-range, we know we found mate.
         let fen = "r1bqkb1r/pppp1ppp/2n2n2/4p2Q/2B1P3/8/PPPP1PPP/RNB1K1NR w KQkq - 1 3";
         let res = search_depth(fen, 3);
-        // This is mate in 1, score should be mate in 1 range
         assert!(
             res.score > MATE - 10,
             "expected mate score, got {}",
@@ -832,12 +888,8 @@ mod tests {
 
     #[test]
     fn repetition_draw() {
-        // Position with shuffling knights that repeats — search should not crash and
-        // should prefer non-repeating if possible. We just test that repetition detection doesn't panic.
         let fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
         let mut pos = parse_fen(fen).unwrap();
-        // Play Ng1f3 Ng8f6 Ng1h3? Actually make a line that repeats: 1. Nf3 Nf6 2. Ng1 Ng8
-        // We'll manually make moves to create repetition history.
         let m1 = crate::board::mv::Move::parse_uci("g1f3").unwrap();
         let m2 = crate::board::mv::Move::parse_uci("g8f6").unwrap();
         let m3 = crate::board::mv::Move::parse_uci("f3g1").unwrap();
@@ -851,7 +903,6 @@ mod tests {
             "should be repetition after shuffling back"
         );
         let res = search_depth(&crate::board::fen::to_fen(&pos), 3);
-        // Score should be 0 or small — repetition is draw
         assert!(res.score.abs() < MATE / 2);
     }
 
@@ -881,7 +932,6 @@ mod tests {
                 pv = p.clone();
             }
         });
-        // Validate PV plays legally
         let mut tmp = parse_fen(fen).unwrap();
         for mv in &pv {
             let mut moves = Vec::new();

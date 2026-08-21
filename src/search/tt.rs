@@ -467,4 +467,38 @@ mod tests {
         let hit = tt.probe(key, 0).unwrap();
         assert_eq!(hit.mv, None);
     }
+
+    #[test]
+    fn concurrent_hammer() {
+        use std::sync::Arc;
+        use std::thread;
+        let tt = Arc::new(TranspositionTable::new(1));
+        let mut handles = Vec::new();
+        for tid in 0..4 {
+            let tt_c = Arc::clone(&tt);
+            handles.push(thread::spawn(move || {
+                for i in 0..50_000u64 {
+                    let key = (tid as u64 * 1_000_000 + i * 7919 + 0x1234) | 1;
+                    let depth = (i % 10) as u8;
+                    let score = (i % 2000) as i32 - 1000;
+                    let bound = match i % 3 {
+                        0 => Bound::Exact,
+                        1 => Bound::Lower,
+                        _ => Bound::Upper,
+                    };
+                    tt_c.store(key, None, score, 0, depth, bound, 0);
+                    let _ = tt_c.probe(key, 0);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        // Verify a known key after hammering.
+        let key = 0xCAFEBABEDEADu64 | 1;
+        tt.store(key, Some(mv("e2e4")), 42, 0, 5, Bound::Exact, 0);
+        let hit = tt.probe(key, 0).expect("should hit after hammer");
+        assert_eq!(hit.score, 42);
+        assert_eq!(hit.mv, Some(mv("e2e4")));
+    }
 }

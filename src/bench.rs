@@ -154,6 +154,9 @@ pub fn run_bench(
             Arc::new(TimeControl::none())
         };
         let stop = AtomicBool::new(false);
+        // Generation bump once per position (matches the old per-search bump
+        // inside `search()`; keeps the single-thread bench signature identical).
+        tt.new_search();
         // Run search; nodes are accumulated via ctx.nodes, returned in result.
         let result = crate::search::search(&mut pos, limits, &stop, &tc, &tt, &mut |_event| {
             // Suppress per-iteration info — bench is quiet.

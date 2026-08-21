@@ -166,14 +166,17 @@ pub fn negamax(
     if ctx.stop.load(Ordering::Relaxed) {
         return 0;
     }
-    if ctx.nodes.is_multiple_of(2048) && ctx.tc.should_hard_stop() {
-        ctx.stop.store(true, Ordering::Relaxed);
-        return 0;
-    }
-    if let Some(limit) = ctx.limits.nodes {
-        if ctx.nodes >= limit {
+    if ctx.nodes.is_multiple_of(2048) {
+        ctx.flush_nodes();
+        if ctx.tc.should_hard_stop() {
             ctx.stop.store(true, Ordering::Relaxed);
             return 0;
+        }
+        if let Some(limit) = ctx.limits.nodes {
+            if ctx.total_nodes.load(Ordering::Relaxed) >= limit {
+                ctx.stop.store(true, Ordering::Relaxed);
+                return 0;
+            }
         }
     }
 
@@ -185,6 +188,7 @@ pub fn negamax(
     if ply > ctx.seldepth {
         ctx.seldepth = ply;
     }
+    ctx.pv_len[ply] = 0;
 
     if pos.is_repetition() || pos.is_fifty_move_draw() {
         return 0;
