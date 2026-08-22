@@ -31,6 +31,7 @@ use crate::eval::PawnCache;
 pub mod alpha_beta;
 pub mod order;
 pub mod quiescence;
+pub mod see;
 pub mod time;
 pub mod tt;
 pub mod worker;
