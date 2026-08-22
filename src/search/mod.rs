@@ -25,8 +25,12 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use crate::board::types::{PieceType, Square};
 use crate::board::{Move, Position, generate_legal, is_square_attacked};
 use crate::eval::PawnCache;
+
+pub type CounterTable = [[Option<Move>; 64]; 6];
+pub type ContHistory = [[[[i32; 64]; 6]; 64]; 6];
 
 pub mod alpha_beta;
 pub mod order;
@@ -174,11 +178,17 @@ pub struct SearchContext<'a> {
     /// Shared TT (SMP-ready, lock-free).
     pub tt: Arc<tt::TranspositionTable>,
     /// Killers: two quiet moves per ply that caused a beta cutoff.
-    #[allow(dead_code)]
     pub killers: [[Option<Move>; 2]; MAX_PLY],
     /// History: side × from × to, gravity with cap ±16384.
-    #[allow(dead_code)]
     pub history: Box<[[[i32; 64]; 64]; 2]>,
+    /// Countermoves: one reply per [prev piece type][prev to] (10a).
+    pub countermoves: Box<CounterTable>,
+    /// Continuation history 1-ply and 2-ply (10b).
+    pub cont1: Box<ContHistory>,
+    pub cont2: Box<ContHistory>,
+    /// Last move per ply: (piece type before move, to square) — for countermove
+    /// and continuation history (10a/b). `None` after null move.
+    pub prev_stack: [Option<(PieceType, Square)>; MAX_PLY],
     /// Pawn structure cache (direct-mapped).
     pub pawn_cache: PawnCache,
     /// Global node counter shared across SMP workers.
@@ -223,6 +233,10 @@ impl<'a> SearchContext<'a> {
             tt,
             killers: [[None; 2]; MAX_PLY],
             history: Box::new([[[0; 64]; 64]; 2]),
+            countermoves: Box::new([[None; 64]; 6]),
+            cont1: Box::new([[[[0; 64]; 6]; 64]; 6]),
+            cont2: Box::new([[[[0; 64]; 6]; 64]; 6]),
+            prev_stack: [None; MAX_PLY],
             pawn_cache: PawnCache::new(),
             total_nodes,
             last_flush: 0,
@@ -431,6 +445,12 @@ pub(crate) fn search_single(
                     }
                 }
                 ctx.pv_len[1] = 0;
+                // Set prev_stack[0] for child ply 1 (10a)
+                if let Some(pc) = pos.piece_at(mv.from) {
+                    ctx.prev_stack[0] = Some((pc.piece_type(), mv.to));
+                } else {
+                    ctx.prev_stack[0] = None;
+                }
                 pos.make_move(mv);
                 let score = -alpha_beta::negamax(
                     pos,
@@ -734,10 +754,33 @@ fn root_search(
             let best_idx = {
                 let slice = &moves[i..];
                 let mut best = 0;
-                let mut best_s =
-                    order::score_move(pos, slice[0], None, &ctx.killers[0], &ctx.history, 0);
+                let mut best_s = order::score_move(
+                    pos,
+                    slice[0],
+                    None,
+                    &ctx.killers[0],
+                    None,
+                    &ctx.history,
+                    None,
+                    &crate::search::order::ZERO_CONT,
+                    None,
+                    &crate::search::order::ZERO_CONT,
+                    0,
+                );
                 for (j, &mv) in slice.iter().enumerate().skip(1) {
-                    let s = order::score_move(pos, mv, None, &ctx.killers[0], &ctx.history, 0);
+                    let s = order::score_move(
+                        pos,
+                        mv,
+                        None,
+                        &ctx.killers[0],
+                        None,
+                        &ctx.history,
+                        None,
+                        &crate::search::order::ZERO_CONT,
+                        None,
+                        &crate::search::order::ZERO_CONT,
+                        0,
+                    );
                     if s > best_s {
                         best_s = s;
                         best = j;
@@ -791,6 +834,12 @@ fn root_search(
             }
         }
 
+        // Record prev move for child ply=1 (counter/continuation — 10a)
+        if let Some(pc) = pos.piece_at(mv.from) {
+            ctx.prev_stack[0] = Some((pc.piece_type(), mv.to));
+        } else {
+            ctx.prev_stack[0] = None;
+        }
         pos.make_move(mv);
         let score = if i == 0 {
             -alpha_beta::negamax(pos, depth - 1, -beta, -alpha, 1, true, ctx)

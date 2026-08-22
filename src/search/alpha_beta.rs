@@ -255,6 +255,9 @@ pub fn negamax(
         && pos.has_non_pawn_material(pos.side_to_move())
     {
         let r = 2 + depth / 4;
+        if ply < super::MAX_PLY {
+            ctx.prev_stack[ply] = None;
+        }
         pos.make_null_move();
         let score = -negamax(pos, depth - 1 - r, -beta, -beta + 1, ply + 1, false, ctx);
         pos.unmake_null_move();
@@ -277,13 +280,37 @@ pub fn negamax(
         return 0;
     }
 
-    // Pre-score once (O(n) instead of O(n²))
+    // Pre-score once (O(n) instead of O(n²)) — countermove + continuation history
+    let counter = if ply > 0 {
+        if let Some((pp, ps)) = ctx.prev_stack[ply - 1] {
+            ctx.countermoves[pp as usize][ps.index() as usize]
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let prev1 = if ply > 0 {
+        ctx.prev_stack[ply - 1]
+    } else {
+        None
+    };
+    let prev2 = if ply > 1 {
+        ctx.prev_stack[ply - 2]
+    } else {
+        None
+    };
     crate::search::order::score_list(
         pos,
         &mut list,
         tt_move,
         &ctx.killers[ply],
+        counter,
         &ctx.history,
+        prev1,
+        &ctx.cont1,
+        prev2,
+        &ctx.cont2,
         ply,
     );
 
@@ -292,11 +319,21 @@ pub fn negamax(
     let mut best_score = -MATE * 2;
     let original_alpha = alpha;
     let mut best_move: Option<Move> = None;
-    let mut quiet_tried = 0usize;
+    // Tracker for history malus (10c): quiets actually searched at this node
+    let mut quiets_tried: [Option<Move>; 218] = [None; 218];
+    let mut quiets_cnt: usize = 0;
 
     let list_len = list.len;
     for i in 0..list_len {
         let mv = list.pick_best(i);
+        // Record prev_stack for child: piece type before move, to square (10a)
+        if ply < super::MAX_PLY {
+            if let Some(pc) = pos.piece_at(mv.from) {
+                ctx.prev_stack[ply] = Some((pc.piece_type(), mv.to));
+            } else {
+                ctx.prev_stack[ply] = None;
+            }
+        }
 
         let quiet = is_quiet(pos, mv);
 
@@ -304,12 +341,13 @@ pub fn negamax(
             if depth <= 6 && static_eval + 120 * depth <= alpha {
                 continue;
             }
-            if depth <= 4 && quiet_tried >= 3 + (depth as usize * depth as usize) {
+            if depth <= 4 && quiets_cnt >= 3 + (depth as usize * depth as usize) {
                 continue;
             }
         }
         if quiet {
-            quiet_tried += 1;
+            quiets_tried[quiets_cnt] = Some(mv);
+            quiets_cnt += 1;
         }
 
         if ctx.stop.load(Ordering::Relaxed) {
@@ -408,6 +446,87 @@ pub fn negamax(
                     crate::search::order::update_killers(&mut ctx.killers, ply, mv);
                     let side = pos.side_to_move();
                     crate::search::order::update_history(&mut ctx.history, side, mv, depth);
+                    // Countermove update (10a): store reply to prev move
+                    if ply > 0 {
+                        if let Some((pp, ps)) = ctx.prev_stack[ply - 1] {
+                            ctx.countermoves[pp as usize][ps.index() as usize] = Some(mv);
+                        }
+                    }
+                    // Continuation history updates (10b) + malus for non-cutoff quiets (10c)
+                    let bonus = (depth * depth).clamp(0, 16384);
+                    let malus = -(bonus / 2);
+                    if let Some(pc) = pos.piece_at(mv.from) {
+                        let cur_pt = pc.piece_type();
+                        let cur_to = mv.to;
+                        if ply > 0 {
+                            if let Some((pp, ps)) = ctx.prev_stack[ply - 1] {
+                                crate::search::order::update_cont(
+                                    &mut ctx.cont1,
+                                    pp,
+                                    ps,
+                                    cur_pt,
+                                    cur_to,
+                                    bonus,
+                                );
+                            }
+                        }
+                        if ply > 1 {
+                            if let Some((pp, ps)) = ctx.prev_stack[ply - 2] {
+                                crate::search::order::update_cont(
+                                    &mut ctx.cont2,
+                                    pp,
+                                    ps,
+                                    cur_pt,
+                                    cur_to,
+                                    bonus,
+                                );
+                            }
+                        }
+                    }
+                    // Malus for quiets searched before the cutoff (10c)
+                    for j in 0..quiets_cnt {
+                        if let Some(qm) = quiets_tried[j] {
+                            if qm == mv {
+                                continue;
+                            }
+                            // butterfly malus
+                            crate::search::order::update_history_with_bonus(
+                                &mut ctx.history,
+                                side,
+                                qm,
+                                malus,
+                            );
+                            // cont malus (need qm's own cur piece/to)
+                            if let Some(qpc) = pos.piece_at(qm.from) {
+                                let q_pt = qpc.piece_type();
+                                let q_to = qm.to;
+                                if ply > 0 {
+                                    if let Some((pp, ps)) = ctx.prev_stack[ply - 1] {
+                                        crate::search::order::update_cont(
+                                            &mut ctx.cont1,
+                                            pp,
+                                            ps,
+                                            q_pt,
+                                            q_to,
+                                            malus,
+                                        );
+                                    }
+                                }
+                                if ply > 1 {
+                                    if let Some((pp, ps)) = ctx.prev_stack[ply - 2] {
+                                        crate::search::order::update_cont(
+                                            &mut ctx.cont2,
+                                            pp,
+                                            ps,
+                                            q_pt,
+                                            q_to,
+                                            malus,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 break;
             }

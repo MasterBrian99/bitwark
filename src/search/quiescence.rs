@@ -93,7 +93,19 @@ pub fn quiescence(
     let tt_move = ctx.tt.probe(pos.hash(), ply).and_then(|h| h.mv);
     let dummy_killers = [None, None];
     let dummy_history = [[[0; 64]; 64]; 2];
-    crate::search::order::score_list(pos, &mut list, tt_move, &dummy_killers, &dummy_history, ply);
+    crate::search::order::score_list(
+        pos,
+        &mut list,
+        tt_move,
+        &dummy_killers,
+        None,
+        &dummy_history,
+        None,
+        &crate::search::order::ZERO_CONT,
+        None,
+        &crate::search::order::ZERO_CONT,
+        ply,
+    );
 
     ctx.pv_len[ply] = 0;
 
