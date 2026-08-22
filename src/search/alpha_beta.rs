@@ -216,6 +216,11 @@ pub fn negamax(
         }
     }
 
+    // IIR: no TT move at decent depth → search shallower to get a move
+    if tt_move.is_none() && depth >= 4 {
+        depth -= 1;
+    }
+
     let in_check = if let Some(king_sq) = pos.king_square(pos.side_to_move()) {
         is_square_attacked(pos, king_sq, pos.side_to_move().opposite())
     } else {
@@ -230,6 +235,17 @@ pub fn negamax(
     }
 
     let static_eval = crate::eval::evaluate_cached(pos, &mut ctx.pawn_cache);
+
+    // Razoring: shallow depth, eval far below alpha → qsearch verification
+    if !is_pv && !in_check && depth <= 3 && static_eval.abs() < MATE - MAX_PLY as i32 {
+        let razor_margin = 300 + 200 * (depth - 1);
+        if static_eval + razor_margin < alpha {
+            let score = quiescence(pos, alpha, beta, ply, ctx);
+            if score < alpha {
+                return score;
+            }
+        }
+    }
 
     if !is_pv
         && !in_check
