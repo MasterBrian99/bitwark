@@ -6,7 +6,7 @@
 
 use crate::board::movelist::MoveList;
 use crate::board::types::Color;
-use crate::board::{Move, PieceType, Position};
+use crate::board::{Move, Piece, PieceType, Position};
 
 // Piece values for MVV-LVA (centipawns, same as eval material but King = 20000).
 fn piece_value(pt: PieceType) -> i32 {
@@ -51,10 +51,8 @@ pub fn score_move(
     let captured = if let Some(p) = pos.piece_at(mv.to) {
         Some(p)
     } else if moving.piece_type() == PieceType::Pawn && pos.en_passant() == Some(mv.to) {
-        // En passant captures a pawn — victim value 100.
-        let promo_bonus = mv.promotion.map_or(0, piece_value);
-        let mvv = 10 * 100 - attacker_val + promo_bonus;
-        return 800_000 + mvv;
+        // En passant captures a pawn.
+        Some(Piece::new(moving.color().opposite(), PieceType::Pawn))
     } else {
         None
     };
@@ -63,7 +61,13 @@ pub fn score_move(
         let victim_val = piece_value(cap.piece_type());
         let promo_bonus = mv.promotion.map_or(0, piece_value);
         let mvv = 10 * victim_val - attacker_val + promo_bonus;
-        return 800_000 + mvv;
+        let see_val = crate::search::see::see(pos, mv);
+        if see_val >= 0 {
+            return 800_000 + mvv;
+        } else {
+            // Losing capture — below history quiets (history is -16384..16384)
+            return -20_000 + see_val;
+        }
     }
 
     // Non-capture promotion (quiet promo).
@@ -196,9 +200,10 @@ mod tests {
 
     #[test]
     fn mvv_lva_capture_order() {
-        let pos2 = parse_fen("3rk3/8/8/4p3/8/8/8/3QK3 w - - 0 1").unwrap();
-        let mv_qxr = crate::board::mv::Move::parse_uci("d1d8").unwrap(); // Q x R
-        let mv_qxp = crate::board::mv::Move::parse_uci("d1e2").unwrap(); // quiet
+        // Use undefended captures so SEE is winning and they outrank quiets.
+        let pos2 = parse_fen("r3k3/8/8/8/8/8/8/Q3K3 w - - 0 1").unwrap();
+        let mv_qxr = crate::board::mv::Move::parse_uci("a1a8").unwrap(); // Q x R
+        let mv_qxp = crate::board::mv::Move::parse_uci("a1b2").unwrap(); // quiet
         let dummy_k = [None, None];
         let dummy_h = [[[0; 64]; 64]; 2];
         assert!(
@@ -212,6 +217,32 @@ mod tests {
         };
         let score_rook_cap = score_move(&pos2, mv_qxr, None, &dummy_k, &dummy_h, 0);
         assert!(score_rook_cap > mv_qxp2);
+    }
+
+    #[test]
+    fn see_losing_capture_below_history() {
+        // Queen takes pawn defended by pawn — losing per SEE, should be below history quiets.
+        let pos = parse_fen("4k3/8/2p1p3/3p4/3Q4/8/8/4K3 w - - 0 1").unwrap();
+        let losing = crate::board::mv::Move::parse_uci("d4d5").unwrap(); // QxP defended
+        let quiet = crate::board::mv::Move::parse_uci("d4e4").unwrap();
+        let dummy_k = [None, None];
+        let mut history = [[[0; 64]; 64]; 2];
+        // Give quiet max history
+        history[Color::White as usize][quiet.from.index() as usize][quiet.to.index() as usize] =
+            16384;
+        let s_losing = score_move(&pos, losing, None, &dummy_k, &history, 0);
+        let s_quiet = score_move(&pos, quiet, None, &dummy_k, &history, 0);
+        assert!(
+            s_losing < s_quiet,
+            "losing capture {s_losing} should be below history quiet {s_quiet}"
+        );
+        // But winning capture should still be above killer
+        let pos_win = parse_fen("r3k3/8/8/8/8/8/8/Q3K3 w - - 0 1").unwrap();
+        let winning = crate::board::mv::Move::parse_uci("a1a8").unwrap();
+        let killers = [Some(quiet), None];
+        let s_win = score_move(&pos_win, winning, None, &killers, &history, 0);
+        let s_killer = score_move(&pos_win, quiet, None, &killers, &history, 0);
+        assert!(s_win > s_killer, "winning capture should outrank killer");
     }
 
     #[test]
