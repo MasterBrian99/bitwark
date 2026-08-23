@@ -95,14 +95,15 @@ impl Default for PawnCache {
 pub const TEMPO_BONUS_MG: i32 = 10;
 
 /// Number of scored terms.
-pub const TERM_COUNT: usize = 7;
+pub const TERM_COUNT: usize = 8;
 pub const TERM_MATERIAL: usize = 0;
 pub const TERM_PST: usize = 1;
 pub const TERM_PAWN: usize = 2;
 pub const TERM_MOBILITY: usize = 3;
 pub const TERM_ROOK: usize = 4;
 pub const TERM_BISHOP_PAIR: usize = 5;
-pub const TERM_KING: usize = 6;
+pub const TERM_KING_SHIELD: usize = 6;
+pub const TERM_KING_ATTACK: usize = 7;
 pub const TERM_NAMES: [&str; TERM_COUNT] = [
     "Material",
     "PieceSq",
@@ -110,7 +111,8 @@ pub const TERM_NAMES: [&str; TERM_COUNT] = [
     "Mobility",
     "RookFiles",
     "BishopPair",
-    "KingSafety",
+    "KingShield",
+    "KingAttack",
 ];
 
 /// Per-term MG/EG deltas, white − black. Built once per `breakdown()` call
@@ -260,10 +262,13 @@ pub fn breakdown(pos: &Position) -> EvalBreakdown {
     bd.term_mg[TERM_BISHOP_PAIR] = bp_mg;
     bd.term_eg[TERM_BISHOP_PAIR] = bp_eg;
 
-    // King safety (5d)
-    let (king_mg, king_eg) = king::eval(pos);
-    bd.term_mg[TERM_KING] = king_mg;
-    bd.term_eg[TERM_KING] = king_eg;
+    // King safety (5d -> 11a split)
+    let (shield_mg, shield_eg) = king::shield(pos);
+    bd.term_mg[TERM_KING_SHIELD] = shield_mg;
+    bd.term_eg[TERM_KING_SHIELD] = shield_eg;
+    let (attack_mg, attack_eg) = king::attack(pos);
+    bd.term_mg[TERM_KING_ATTACK] = attack_mg;
+    bd.term_eg[TERM_KING_ATTACK] = attack_eg;
 
     bd
 }
@@ -303,10 +308,11 @@ fn evaluate_with_pawn(pos: &Position, cache: Option<&mut PawnCache>) -> i32 {
     let (mob_mg, mob_eg) = pieces::mobility(pos);
     let (rook_mg, rook_eg) = pieces::rook_files(pos);
     let (bp_mg, bp_eg) = pieces::bishop_pair(pos);
-    let (king_mg, king_eg) = king::eval(pos);
+    let (shield_mg, shield_eg) = king::shield(pos);
+    let (attack_mg, attack_eg) = king::attack(pos);
 
-    let mg = psqt_mg + pawn_mg + mob_mg + rook_mg + bp_mg + king_mg;
-    let eg = psqt_eg + pawn_eg + mob_eg + rook_eg + bp_eg + king_eg;
+    let mg = psqt_mg + pawn_mg + mob_mg + rook_mg + bp_mg + shield_mg + attack_mg;
+    let eg = psqt_eg + pawn_eg + mob_eg + rook_eg + bp_eg + shield_eg + attack_eg;
     let white_score = (mg * phase + eg * (24 - phase)) / 24;
 
     let tempo_scaled = TEMPO_BONUS_MG * phase / 24;
@@ -465,5 +471,48 @@ mod tests {
         // 6 white queens (phase 24, clamped)
         let pos5 = parse_fen("QQQ5/QQQ5/8/8/8/8/8/4K2k w - - 0 1").unwrap();
         assert_eq!(game_phase(&pos5), 24); // 6 queens = 24, clamped
+    }
+
+    #[test]
+    fn evaluate_matches_breakdown() {
+        let fens = [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            "r1bq1rk1/pp2ppbp/2np1np1/2p5/2P1P3/1PN1B3/PB1Q1PPP/R3K2R w KQ - 0 1",
+            "4k3/8/8/8/3P4/8/8/4K3 w - - 0 1",
+            "4k3/8/8/4q3/2b5/8/8/4K3 w - - 0 1",
+            "4k3/8/8/8/8/8/5PPP/5RK1 w - - 0 1",
+            "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1",
+            "4k3/3P4/8/8/8/8/8/4K3 w - - 0 1",
+        ];
+        for fen in fens {
+            let pos = parse_fen(fen).unwrap();
+            let bd = breakdown(&pos);
+            let white_score = bd.white_score();
+            let tempo_scaled = TEMPO_BONUS_MG * bd.phase / 24;
+            let white_pov = white_score
+                + if pos.side_to_move() == Color::White {
+                    tempo_scaled
+                } else {
+                    -tempo_scaled
+                };
+            let stm_via_bd = if pos.side_to_move() == Color::White {
+                white_pov
+            } else {
+                -white_pov
+            };
+            let ev = evaluate(&pos);
+            assert_eq!(
+                ev, stm_via_bd,
+                "evaluate vs breakdown mismatch for {fen}: ev={ev} bd_stm={stm_via_bd} bd={bd:?}"
+            );
+            // Cached path must match too.
+            let mut cache = PawnCache::new();
+            let ev_cached = evaluate_cached(&pos, &mut cache);
+            assert_eq!(
+                ev_cached, ev,
+                "cached vs uncached mismatch for {fen}: cached={ev_cached} ev={ev}"
+            );
+        }
     }
 }
