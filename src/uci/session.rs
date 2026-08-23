@@ -231,6 +231,7 @@ impl UciSession {
                     let total_cp = total as f32 / 100.0;
                     self.send(&format!("Total evaluation: {total_cp:.2} (white side)"))
                         .await;
+                    self.send(&format!("Scale factor: {}/64", bd.scale)).await;
                     let stm = crate::eval::evaluate(&self.position);
                     let stm_cp = stm as f32 / 100.0;
                     self.send(&format!("Total evaluation (side to move): {stm_cp:.2}"))

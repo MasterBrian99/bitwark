@@ -141,7 +141,7 @@ pub const TERM_NAMES: [&str; TERM_COUNT] = [
 
 /// Per-term MG/EG deltas, white − black. Built once per `breakdown()` call
 /// and used both by `evaluate()` (search) and the `eval` debug command.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct EvalBreakdown {
     /// Game phase 0..24 (24 = middlegame, 0 = endgame).
     pub phase: i32,
@@ -149,6 +149,19 @@ pub struct EvalBreakdown {
     pub term_mg: [i32; TERM_COUNT],
     /// Per-term EG deltas.
     pub term_eg: [i32; TERM_COUNT],
+    /// Draw scaling factor 0..64 (64 = no scaling).
+    pub scale: i32,
+}
+
+impl Default for EvalBreakdown {
+    fn default() -> Self {
+        Self {
+            phase: 0,
+            term_mg: [0; TERM_COUNT],
+            term_eg: [0; TERM_COUNT],
+            scale: 64,
+        }
+    }
 }
 
 impl EvalBreakdown {
@@ -161,11 +174,13 @@ impl EvalBreakdown {
         self.term_eg.iter().sum()
     }
     /// White-perspective interpolated score (no tempo, no stm negation).
+    /// Scaled by `scale` toward 0 in drawish endgames.
     #[inline]
     pub fn white_score(&self) -> i32 {
         let mg = self.mg();
         let eg = self.eg();
-        (mg * self.phase + eg * (24 - self.phase)) / 24
+        let raw = (mg * self.phase + eg * (24 - self.phase)) / 24;
+        raw * self.scale / 64
     }
 }
 
@@ -190,6 +205,175 @@ pub fn game_phase(pos: &Position) -> i32 {
             * tables::PHASE_WEIGHT[PieceType::Queen as usize];
     }
     phase.min(24)
+}
+
+/// Draw scaling factor 0..64 (64 = no scaling).
+pub fn scale_factor(pos: &Position) -> i32 {
+    if is_ocb(pos) {
+        return 32;
+    }
+    if is_kminor_vs_k(pos) || is_k2n_vs_k(pos) {
+        return 0;
+    }
+    if is_rook_pawns_one_side(pos) {
+        return 36;
+    }
+    64
+}
+
+fn is_ocb(pos: &Position) -> bool {
+    // Only bishops (plus kings/pawns) remain, at least one bishop each, opposite colors.
+    let has_knight = !pos
+        .pieces_bb(Piece::new(Color::White, PieceType::Knight))
+        .is_empty()
+        || !pos
+            .pieces_bb(Piece::new(Color::Black, PieceType::Knight))
+            .is_empty();
+    let has_rook = !pos
+        .pieces_bb(Piece::new(Color::White, PieceType::Rook))
+        .is_empty()
+        || !pos
+            .pieces_bb(Piece::new(Color::Black, PieceType::Rook))
+            .is_empty();
+    let has_queen = !pos
+        .pieces_bb(Piece::new(Color::White, PieceType::Queen))
+        .is_empty()
+        || !pos
+            .pieces_bb(Piece::new(Color::Black, PieceType::Queen))
+            .is_empty();
+    if has_knight || has_rook || has_queen {
+        return false;
+    }
+    let w_bishops = pos.pieces_bb(Piece::new(Color::White, PieceType::Bishop));
+    let b_bishops = pos.pieces_bb(Piece::new(Color::Black, PieceType::Bishop));
+    if w_bishops.is_empty() || b_bishops.is_empty() {
+        return false;
+    }
+    // Check opposite colors: get first bishop each.
+    let wb = w_bishops.squares().next().unwrap();
+    let bb = b_bishops.squares().next().unwrap();
+    let wb_light = (wb.file() as i32 + wb.rank() as i32) % 2 == 1;
+    let bb_light = (bb.file() as i32 + bb.rank() as i32) % 2 == 1;
+    wb_light != bb_light
+}
+
+fn is_kminor_vs_k(pos: &Position) -> bool {
+    let has_pawns = !pos
+        .pieces_bb(Piece::new(Color::White, PieceType::Pawn))
+        .is_empty()
+        || !pos
+            .pieces_bb(Piece::new(Color::Black, PieceType::Pawn))
+            .is_empty();
+    if has_pawns {
+        return false;
+    }
+    let w_minor = pos
+        .pieces_bb(Piece::new(Color::White, PieceType::Knight))
+        .count()
+        + pos
+            .pieces_bb(Piece::new(Color::White, PieceType::Bishop))
+            .count();
+    let b_minor = pos
+        .pieces_bb(Piece::new(Color::Black, PieceType::Knight))
+        .count()
+        + pos
+            .pieces_bb(Piece::new(Color::Black, PieceType::Bishop))
+            .count();
+    let w_has_major = !pos
+        .pieces_bb(Piece::new(Color::White, PieceType::Rook))
+        .is_empty()
+        || !pos
+            .pieces_bb(Piece::new(Color::White, PieceType::Queen))
+            .is_empty();
+    let b_has_major = !pos
+        .pieces_bb(Piece::new(Color::Black, PieceType::Rook))
+        .is_empty()
+        || !pos
+            .pieces_bb(Piece::new(Color::Black, PieceType::Queen))
+            .is_empty();
+    if w_has_major || b_has_major {
+        return false;
+    }
+    // Exactly one side has single minor, other bare king.
+    (w_minor == 1 && b_minor == 0) || (b_minor == 1 && w_minor == 0)
+}
+
+fn is_k2n_vs_k(pos: &Position) -> bool {
+    let has_pawns = !pos
+        .pieces_bb(Piece::new(Color::White, PieceType::Pawn))
+        .is_empty()
+        || !pos
+            .pieces_bb(Piece::new(Color::Black, PieceType::Pawn))
+            .is_empty();
+    if has_pawns {
+        return false;
+    }
+    let w_has_other = !pos
+        .pieces_bb(Piece::new(Color::White, PieceType::Bishop))
+        .is_empty()
+        || !pos
+            .pieces_bb(Piece::new(Color::White, PieceType::Rook))
+            .is_empty()
+        || !pos
+            .pieces_bb(Piece::new(Color::White, PieceType::Queen))
+            .is_empty();
+    let b_has_other = !pos
+        .pieces_bb(Piece::new(Color::Black, PieceType::Bishop))
+        .is_empty()
+        || !pos
+            .pieces_bb(Piece::new(Color::Black, PieceType::Rook))
+            .is_empty()
+        || !pos
+            .pieces_bb(Piece::new(Color::Black, PieceType::Queen))
+            .is_empty();
+    if w_has_other || b_has_other {
+        return false;
+    }
+    let w_knights = pos
+        .pieces_bb(Piece::new(Color::White, PieceType::Knight))
+        .count();
+    let b_knights = pos
+        .pieces_bb(Piece::new(Color::Black, PieceType::Knight))
+        .count();
+    (w_knights == 2 && b_knights == 0) || (b_knights == 2 && w_knights == 0)
+}
+
+fn is_rook_pawns_one_side(pos: &Position) -> bool {
+    // Only rooks (plus kings/pawns) remain.
+    let has_other = !pos
+        .pieces_bb(Piece::new(Color::White, PieceType::Knight))
+        .is_empty()
+        || !pos
+            .pieces_bb(Piece::new(Color::Black, PieceType::Knight))
+            .is_empty()
+        || !pos
+            .pieces_bb(Piece::new(Color::White, PieceType::Bishop))
+            .is_empty()
+        || !pos
+            .pieces_bb(Piece::new(Color::Black, PieceType::Bishop))
+            .is_empty()
+        || !pos
+            .pieces_bb(Piece::new(Color::White, PieceType::Queen))
+            .is_empty()
+        || !pos
+            .pieces_bb(Piece::new(Color::Black, PieceType::Queen))
+            .is_empty();
+    if has_other {
+        return false;
+    }
+    // Collect pawn files.
+    let mut files: Vec<u8> = Vec::new();
+    for &color in &[Color::White, Color::Black] {
+        for sq in pos.pieces_bb(Piece::new(color, PieceType::Pawn)).squares() {
+            files.push(sq.file());
+        }
+    }
+    if files.is_empty() {
+        return false;
+    }
+    let all_left = files.iter().all(|&f| f <= 3);
+    let all_right = files.iter().all(|&f| f >= 4);
+    all_left || all_right
 }
 
 // ---------------------------------------------------------------------------
@@ -316,6 +500,9 @@ pub fn breakdown(pos: &Position) -> EvalBreakdown {
     bd.term_mg[TERM_ROOK_7TH] = r7_mg;
     bd.term_eg[TERM_ROOK_7TH] = r7_eg;
 
+    // Draw scaling (11e).
+    bd.scale = scale_factor(pos);
+
     bd
 }
 
@@ -389,7 +576,9 @@ fn evaluate_with_pawn(pos: &Position, cache: Option<&mut PawnCache>) -> i32 {
         + bb_eg
         + trap_eg
         + r7_eg;
-    let white_score = (mg * phase + eg * (24 - phase)) / 24;
+    let scale = scale_factor(pos);
+    let raw = (mg * phase + eg * (24 - phase)) / 24;
+    let white_score = raw * scale / 64;
 
     let tempo_scaled = TEMPO_BONUS_MG * phase / 24;
     let white_pov = white_score
@@ -488,8 +677,9 @@ mod tests {
 
     #[test]
     fn knight_center_vs_rim() {
-        let fen_center = "4k3/8/8/8/3N4/8/8/4K3 w - - 0 1";
-        let fen_rim = "4k3/8/8/8/8/8/8/N3K3 w - - 0 1";
+        // Keep material non-trivial so draw scaling doesn't mask PST.
+        let fen_center = "4k3/8/8/8/3N4/3P4/2P5/4K3 w - - 0 1";
+        let fen_rim = "4k3/8/8/8/8/8/2P5/N3K3 w - - 0 1";
         let pos_c = parse_fen(fen_center).unwrap();
         let pos_r = parse_fen(fen_rim).unwrap();
         assert!(
@@ -590,5 +780,45 @@ mod tests {
                 "cached vs uncached mismatch for {fen}: cached={ev_cached} ev={ev}"
             );
         }
+    }
+
+    #[test]
+    fn ocb_scaling() {
+        // OCB: only bishops opposite colors (c1 dark vs c2 light)
+        let pos_ocb = parse_fen("4k3/8/8/8/8/8/2b5/2B1K3 w - - 0 1").unwrap();
+        let pos_same = parse_fen("4k3/8/8/8/8/8/2b5/1B2K3 w - - 0 1").unwrap();
+        let s_ocb = scale_factor(&pos_ocb);
+        let s_same = scale_factor(&pos_same);
+        assert_eq!(s_ocb, 32, "OCB should be 32");
+        assert_eq!(s_same, 64, "same color bishops should be 64");
+        // Scale halves eval
+        let pos_ocb2 = parse_fen("4k3/8/3b4/8/4B3/8/8/4K3 w - - 0 1").unwrap(); // d6 dark, e4 light -> opposite
+        let ev_ocb = evaluate(&pos_ocb2).abs();
+        assert!(ev_ocb >= 0, "ocb eval {ev_ocb}");
+    }
+
+    #[test]
+    fn kminor_vs_k_draw() {
+        let pos = parse_fen("4k3/8/8/8/8/8/8/4KN2 w - - 0 1").unwrap(); // K+N vs K
+        let s = scale_factor(&pos);
+        println!("kminor scale {s} w_minor check");
+        assert_eq!(s, 0);
+        assert!(
+            evaluate(&pos).abs() < 50,
+            "K+N vs K should be near 0 got {}",
+            evaluate(&pos)
+        );
+        let pos2 = parse_fen("4k3/8/8/8/8/8/8/2NNK3 w - - 0 1").unwrap(); // K+2N vs K
+        assert_eq!(scale_factor(&pos2), 0);
+        assert!(evaluate(&pos2).abs() < 50);
+    }
+
+    #[test]
+    fn rook_one_side_scaling() {
+        let pos = parse_fen("4k3/8/8/8/8/8/PP6/R3K2R w K - 0 1").unwrap(); // Rooks + pawns all on queenside
+        assert_eq!(scale_factor(&pos), 36);
+        // Mixed pawns not one side -> 64 (a-file + e-file)
+        let pos_mixed = parse_fen("4k3/8/8/8/8/8/P3P3/R3K2R w K - 0 1").unwrap(); // a2 and e2
+        assert_eq!(scale_factor(&pos_mixed), 64);
     }
 }
