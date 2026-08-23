@@ -24,7 +24,7 @@
 //! Pawn structure, mobility/rook files/bishop pair, and king safety each contribute MG/EG deltas to the same
 //! interpolated total.
 
-use crate::board::{Color, Piece, PieceType, Position};
+use crate::board::{Bitboard, Color, Piece, PieceType, Position};
 
 pub mod king;
 pub mod pawns;
@@ -33,11 +33,15 @@ pub mod tables;
 
 /// Pawn structure cache — direct-mapped, keyed by pawn_hash.
 /// Pure function cache: a miss recomputes, a collision overwrites.
+/// Stores pawn-structure mg/eg plus passer bitboards (pawn-vs-pawn only,
+/// hence cache-pure); passer scoring (king-dependent) lives outside the cache.
 #[derive(Clone, Copy, Debug)]
 struct PawnEntry {
     key: u64,
     mg: i32,
     eg: i32,
+    w_passers: u64,
+    b_passers: u64,
 }
 
 pub struct PawnCache {
@@ -47,13 +51,15 @@ pub struct PawnCache {
 
 impl PawnCache {
     pub fn new() -> Self {
-        let size = 1 << 14; // 16384 entries × ~16 bytes = 256 KiB
+        let size = 1 << 14; // 16384 entries × ~32 bytes = 512 KiB
         Self {
             entries: vec![
                 PawnEntry {
                     key: 0,
                     mg: 0,
-                    eg: 0
+                    eg: 0,
+                    w_passers: 0,
+                    b_passers: 0,
                 };
                 size
             ],
@@ -62,19 +68,25 @@ impl PawnCache {
     }
 
     #[inline]
-    pub fn probe(&self, key: u64) -> Option<(i32, i32)> {
+    pub fn probe(&self, key: u64) -> Option<(i32, i32, Bitboard, Bitboard)> {
         let e = &self.entries[(key as usize) & self.mask];
         if e.key == key {
-            Some((e.mg, e.eg))
+            Some((e.mg, e.eg, Bitboard(e.w_passers), Bitboard(e.b_passers)))
         } else {
             None
         }
     }
 
     #[inline]
-    pub fn store(&mut self, key: u64, mg: i32, eg: i32) {
+    pub fn store(&mut self, key: u64, mg: i32, eg: i32, w: Bitboard, b: Bitboard) {
         let idx = (key as usize) & self.mask;
-        self.entries[idx] = PawnEntry { key, mg, eg };
+        self.entries[idx] = PawnEntry {
+            key,
+            mg,
+            eg,
+            w_passers: w.0,
+            b_passers: b.0,
+        };
     }
 }
 
@@ -95,7 +107,7 @@ impl Default for PawnCache {
 pub const TEMPO_BONUS_MG: i32 = 10;
 
 /// Number of scored terms.
-pub const TERM_COUNT: usize = 8;
+pub const TERM_COUNT: usize = 10;
 pub const TERM_MATERIAL: usize = 0;
 pub const TERM_PST: usize = 1;
 pub const TERM_PAWN: usize = 2;
@@ -104,6 +116,8 @@ pub const TERM_ROOK: usize = 4;
 pub const TERM_BISHOP_PAIR: usize = 5;
 pub const TERM_KING_SHIELD: usize = 6;
 pub const TERM_KING_ATTACK: usize = 7;
+pub const TERM_PASSERS: usize = 8;
+pub const TERM_KING_ACT: usize = 9;
 pub const TERM_NAMES: [&str; TERM_COUNT] = [
     "Material",
     "PieceSq",
@@ -113,6 +127,8 @@ pub const TERM_NAMES: [&str; TERM_COUNT] = [
     "BishopPair",
     "KingShield",
     "KingAttack",
+    "Passers",
+    "KingAct",
 ];
 
 /// Per-term MG/EG deltas, white − black. Built once per `breakdown()` call
@@ -244,10 +260,13 @@ pub fn breakdown(pos: &Position) -> EvalBreakdown {
         }
     }
 
-    // Pawn structure (5b)
-    let (pawn_mg, pawn_eg) = pawns::eval(pos);
+    // Pawn structure (5b) + 11b passers split
+    let (pawn_mg, pawn_eg, w_pass, b_pass) = pawns::pawn_structure_and_passers(pos);
     bd.term_mg[TERM_PAWN] = pawn_mg;
     bd.term_eg[TERM_PAWN] = pawn_eg;
+    let (pass_mg, pass_eg) = pawns::passer_score(pos, w_pass, b_pass);
+    bd.term_mg[TERM_PASSERS] = pass_mg;
+    bd.term_eg[TERM_PASSERS] = pass_eg;
 
     // Piece terms (5c)
     let (mob_mg, mob_eg) = pieces::mobility(pos);
@@ -269,6 +288,11 @@ pub fn breakdown(pos: &Position) -> EvalBreakdown {
     let (attack_mg, attack_eg) = king::attack(pos);
     bd.term_mg[TERM_KING_ATTACK] = attack_mg;
     bd.term_eg[TERM_KING_ATTACK] = attack_eg;
+
+    // King activity (11b EG)
+    let (ka_mg, ka_eg) = king::king_activity(pos);
+    bd.term_mg[TERM_KING_ACT] = ka_mg;
+    bd.term_eg[TERM_KING_ACT] = ka_eg;
 
     bd
 }
@@ -293,26 +317,28 @@ fn evaluate_with_pawn(pos: &Position, cache: Option<&mut PawnCache>) -> i32 {
     let psqt_mg = pos.psqt_mg();
     let psqt_eg = pos.psqt_eg();
 
-    let (pawn_mg, pawn_eg) = if let Some(c) = cache {
-        if let Some((mg, eg)) = c.probe(pos.pawn_hash()) {
-            (mg, eg)
+    let (pawn_mg, pawn_eg, w_pass, b_pass) = if let Some(c) = cache {
+        if let Some((mg, eg, w, b)) = c.probe(pos.pawn_hash()) {
+            (mg, eg, w, b)
         } else {
-            let (mg, eg) = pawns::eval(pos);
-            c.store(pos.pawn_hash(), mg, eg);
-            (mg, eg)
+            let (mg, eg, w, b) = pawns::pawn_structure_and_passers(pos);
+            c.store(pos.pawn_hash(), mg, eg, w, b);
+            (mg, eg, w, b)
         }
     } else {
-        pawns::eval(pos)
+        pawns::pawn_structure_and_passers(pos)
     };
+    let (pass_mg, pass_eg) = pawns::passer_score(pos, w_pass, b_pass);
 
     let (mob_mg, mob_eg) = pieces::mobility(pos);
     let (rook_mg, rook_eg) = pieces::rook_files(pos);
     let (bp_mg, bp_eg) = pieces::bishop_pair(pos);
     let (shield_mg, shield_eg) = king::shield(pos);
     let (attack_mg, attack_eg) = king::attack(pos);
+    let (ka_mg, ka_eg) = king::king_activity(pos);
 
-    let mg = psqt_mg + pawn_mg + mob_mg + rook_mg + bp_mg + shield_mg + attack_mg;
-    let eg = psqt_eg + pawn_eg + mob_eg + rook_eg + bp_eg + shield_eg + attack_eg;
+    let mg = psqt_mg + pawn_mg + pass_mg + mob_mg + rook_mg + bp_mg + shield_mg + attack_mg + ka_mg;
+    let eg = psqt_eg + pawn_eg + pass_eg + mob_eg + rook_eg + bp_eg + shield_eg + attack_eg + ka_eg;
     let white_score = (mg * phase + eg * (24 - phase)) / 24;
 
     let tempo_scaled = TEMPO_BONUS_MG * phase / 24;

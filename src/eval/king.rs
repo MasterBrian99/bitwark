@@ -203,6 +203,39 @@ fn king_attack_weight_and_count(pos: &Position, king_sq: Square, attacker: Color
     (weight, attackers)
 }
 
+/// Endgame king centralization (EG-heavy), scaled by phase.
+///
+/// MG ≈ 0 so middlegame castling isn't penalized. EG bonus tapers from 0 at
+/// phase 24 to full at phase 0.
+pub fn king_activity(pos: &Position) -> (i32, i32) {
+    let phase = crate::eval::game_phase(pos);
+    // Centralization table: 0 at corners, ~25 at center (d4,e4,d5,e5).
+    // Based on Chebyshev distance from center.
+    let w = pos.king_square(Color::White);
+    let b = pos.king_square(Color::Black);
+    let w_central = w.map(central_bonus).unwrap_or(0);
+    let b_central = b.map(central_bonus).unwrap_or(0);
+    let eg = (w_central - b_central) * (24 - phase) / 24;
+    (0, eg)
+}
+
+fn central_bonus(sq: Square) -> i32 {
+    let file = sq.file() as i32;
+    let rank = sq.rank() as i32;
+    // Distance from nearest center (d4=3,3 ; e4=4,3 ; d5=3,4 ; e5=4,4)
+    let df = (file - 3).abs().min((file - 4).abs());
+    let dr = (rank - 3).abs().min((rank - 4).abs());
+    let dist = df.max(dr); // Chebyshev
+    // 0 dist => 20, 1 => 12, 2=>6, 3=>0
+    match dist {
+        0 => 20,
+        1 => 12,
+        2 => 6,
+        3 => 0,
+        _ => -4,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
