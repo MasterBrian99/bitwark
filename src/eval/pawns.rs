@@ -17,6 +17,14 @@ const ISOLATED_PENALTY_MG: i32 = -10;
 const ISOLATED_PENALTY_EG: i32 = -15;
 const DOUBLED_PENALTY_MG: i32 = -11;
 const DOUBLED_PENALTY_EG: i32 = -18;
+const BACKWARD_PENALTY_MG: i32 = -8;
+const BACKWARD_PENALTY_EG: i32 = -15;
+const PHALANX_BONUS_MG: i32 = 4;
+const PHALANX_BONUS_EG: i32 = 8;
+const CONNECTED_BONUS_MG: i32 = 6;
+const CONNECTED_BONUS_EG: i32 = 10;
+const ISLAND_PENALTY_MG: i32 = -8;
+const ISLAND_PENALTY_EG: i32 = -12;
 
 // Passed pawn flat bonus per rank (index = rank 0..7).
 // White's perspective: rank increases toward promotion (rank 7 large).
@@ -104,6 +112,24 @@ fn eval_side_structure(
             eg += ISOLATED_PENALTY_EG;
         }
 
+        // Phalanx: side-by-side pawn on same rank adjacent file.
+        if has_phalanx(sq, color, own_pawns) {
+            mg += PHALANX_BONUS_MG;
+            eg += PHALANX_BONUS_EG;
+        }
+
+        // Connected: defended by own pawn on adjacent file one rank behind.
+        if is_connected(sq, color, own_pawns) {
+            mg += CONNECTED_BONUS_MG;
+            eg += CONNECTED_BONUS_EG;
+        }
+
+        // Backward: stop square attacked by enemy pawn, not supported from behind.
+        if is_backward(sq, color, own_pawns, enemy_pawns) {
+            mg += BACKWARD_PENALTY_MG;
+            eg += BACKWARD_PENALTY_EG;
+        }
+
         // Passer detection (pawn-vs-pawn only) — store bitboard, don't score yet.
         if is_passed(sq, color, enemy_pawns) {
             passers = Bitboard(passers.0 | Bitboard::from_sq(sq).0);
@@ -118,6 +144,14 @@ fn eval_side_structure(
             mg += extra * DOUBLED_PENALTY_MG;
             eg += extra * DOUBLED_PENALTY_EG;
         }
+    }
+
+    // Pawn islands: groups of occupied files with gap >=1.
+    let islands = count_islands(&file_counts);
+    if islands > 1 {
+        let extra = islands - 1;
+        mg += extra * ISLAND_PENALTY_MG;
+        eg += extra * ISLAND_PENALTY_EG;
     }
 
     (mg, eg, passers)
@@ -378,6 +412,123 @@ fn candidate_passers(
     cands
 }
 
+fn has_phalanx(sq: Square, _color: Color, own_pawns: Bitboard) -> bool {
+    let file = sq.file() as i32;
+    let rank = sq.rank() as i32;
+    for df in [-1, 1] {
+        let f = file + df;
+        if !(0..8).contains(&f) {
+            continue;
+        }
+        let s = Square::new((rank * 8 + f) as u8);
+        if own_pawns.contains(s) {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_connected(sq: Square, color: Color, own_pawns: Bitboard) -> bool {
+    let file = sq.file() as i32;
+    let rank = sq.rank() as i32;
+    let behind = if color == Color::White {
+        rank - 1
+    } else {
+        rank + 1
+    };
+    if !(0..8).contains(&behind) {
+        return false;
+    }
+    for df in [-1, 1] {
+        let f = file + df;
+        if !(0..8).contains(&f) {
+            continue;
+        }
+        let s = Square::new((behind * 8 + f) as u8);
+        if own_pawns.contains(s) {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_backward(sq: Square, color: Color, own_pawns: Bitboard, enemy_pawns: Bitboard) -> bool {
+    let file = sq.file() as i32;
+    let rank = sq.rank() as i32;
+    // Stop square one ahead.
+    let stop_rank = if color == Color::White {
+        rank + 1
+    } else {
+        rank - 1
+    };
+    if !(0..8).contains(&stop_rank) {
+        return false;
+    }
+    // Is stop square attacked by enemy pawn? For White pawn, enemy black pawn at (f±1, stop_rank+1)
+    // attacks stop. For Black pawn, enemy white pawn at (f±1, stop_rank-1).
+    let attacker_rank = if color == Color::White {
+        stop_rank + 1
+    } else {
+        stop_rank - 1
+    };
+    if !(0..8).contains(&attacker_rank) {
+        return false;
+    }
+    let mut attacked = false;
+    for df in [-1, 1] {
+        let f = file + df;
+        if !(0..8).contains(&f) {
+            continue;
+        }
+        let s = Square::new((attacker_rank * 8 + f) as u8);
+        if enemy_pawns.contains(s) {
+            attacked = true;
+            break;
+        }
+    }
+    if !attacked {
+        return false;
+    }
+    // Not supported from behind: no own pawn on adjacent files behind.
+    let behind_start = if color == Color::White { 0 } else { rank + 1 };
+    let behind_end = if color == Color::White { rank } else { 8 };
+    for df in [-1, 1] {
+        let f = file + df;
+        if !(0..8).contains(&f) {
+            continue;
+        }
+        for r in behind_start..behind_end {
+            if color == Color::White && r >= rank {
+                continue;
+            }
+            if color == Color::Black && r <= rank {
+                continue;
+            }
+            let s = Square::new((r * 8 + f) as u8);
+            if own_pawns.contains(s) {
+                return false; // supported from behind
+            }
+        }
+    }
+    true
+}
+
+fn count_islands(file_counts: &[u8; 8]) -> i32 {
+    let mut islands = 0;
+    let mut in_island = false;
+    for &cnt in file_counts {
+        if cnt > 0 {
+            if !in_island {
+                islands += 1;
+                in_island = true;
+            }
+        } else {
+            in_island = false;
+        }
+    }
+    islands
+}
+
 fn is_passed(sq: Square, color: Color, enemy_pawns: Bitboard) -> bool {
     let file = sq.file() as i32;
     let rank = sq.rank() as i32;
@@ -491,5 +642,41 @@ mod tests {
         let su = passer_score(&pos_unstoppable, wp_u, Bitboard::EMPTY);
         let sc = passer_score(&pos_catchable, wp_c, Bitboard::EMPTY);
         assert!(su.1 > sc.1, "unstoppable {su:?} vs catchable {sc:?}");
+    }
+
+    #[test]
+    fn backward_detected() {
+        // White pawn d4 (3,3) with black pawn c5 (2,4) attacks stop d5? Actually
+        // black pawn c5 attacks d4/b4? Need to craft backward: white pawn c3 (2,2)
+        // stop c4, black pawn b5 (1,4) doesn't attack c4 — use b4/d4 pattern?
+        // Simplest: white pawn d4 (3,3) stop d5 attacked by black pawn c6 (2,5) -> c6 attacks d5.
+        // No own pawn on c/e behind.
+        let pos_back = parse_fen("4k3/2p5/8/8/3P4/8/8/4K3 w - - 0 1").unwrap(); // bp c7? need rank 6: fen rank 7 is row 6...
+        // Use c6 (2,5) fen "2p5" => pawn c6 at file2 rank5? Let's use known: rank 6 is 2 rows from top: fen "8/2p5/8/3P4/8/8/8/4K3" -> wp d4, bp c6
+        let pos_back2 = parse_fen("4k3/8/2p5/8/3P4/8/8/4K3 w - - 0 1").unwrap(); // bp c6
+        let pos_supported = parse_fen("4k3/8/2p5/8/3P4/2P5/8/4K3 w - - 0 1").unwrap(); // wp c3 supports
+        let b = pawn_structure_and_passers(&pos_back2).0;
+        let s = pawn_structure_and_passers(&pos_supported).0;
+        assert!(b < s, "backward {b} vs supported {s}");
+        let _ = pos_back; // silence
+    }
+
+    #[test]
+    fn phalanx_bonus() {
+        let pos_phalanx = parse_fen("4k3/8/8/8/2PP4/8/8/4K3 w - - 0 1").unwrap(); // c4 d4
+        let pos_isolated = parse_fen("4k3/8/8/8/2P3P1/8/8/4K3 w - - 0 1").unwrap(); // c4 g4 far
+        let p = pawn_structure_and_passers(&pos_phalanx).0;
+        let i = pawn_structure_and_passers(&pos_isolated).0;
+        assert!(p > i, "phalanx {p} vs isolated {i}");
+    }
+
+    #[test]
+    fn pawn_islands_penalty() {
+        // 3 islands vs 1 island
+        let pos_spread = parse_fen("4k3/8/8/8/8/8/P1P2P2/4K3 w - - 0 1").unwrap(); // a2 c2 f2
+        let pos_compact = parse_fen("4k3/8/8/8/8/8/PPP5/4K3 w - - 0 1").unwrap(); // a2 b2 c2
+        let spread = pawn_structure_and_passers(&pos_spread).0;
+        let compact = pawn_structure_and_passers(&pos_compact).0;
+        assert!(compact > spread, "compact {compact} vs spread {spread}");
     }
 }
