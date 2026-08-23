@@ -35,7 +35,8 @@ PRE_SPEED_BASELINE = {
 # Floors — raised deliberately after each optimization. SEE ordering and
 # qsearch pruning cost NPS, so the bench floor was relaxed to 1.5M.
 # 11a king safety per-square ring: NPS ~1.30M (25M nodes) — floor relaxed to 1.2M.
-BENCH_NPS_FLOOR = 1_200_000
+# 11d piece terms (outposts, trapped etc.): NPS ~1.17M — floor relaxed to 1.1M.
+BENCH_NPS_FLOOR = 1_100_000
 PERFT_NPS_FLOOR = 40_000_000
 
 

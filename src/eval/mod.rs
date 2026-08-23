@@ -107,7 +107,7 @@ impl Default for PawnCache {
 pub const TEMPO_BONUS_MG: i32 = 10;
 
 /// Number of scored terms.
-pub const TERM_COUNT: usize = 10;
+pub const TERM_COUNT: usize = 14;
 pub const TERM_MATERIAL: usize = 0;
 pub const TERM_PST: usize = 1;
 pub const TERM_PAWN: usize = 2;
@@ -118,6 +118,10 @@ pub const TERM_KING_SHIELD: usize = 6;
 pub const TERM_KING_ATTACK: usize = 7;
 pub const TERM_PASSERS: usize = 8;
 pub const TERM_KING_ACT: usize = 9;
+pub const TERM_OUTPOSTS: usize = 10;
+pub const TERM_BAD_BISHOP: usize = 11;
+pub const TERM_TRAPPED: usize = 12;
+pub const TERM_ROOK_7TH: usize = 13;
 pub const TERM_NAMES: [&str; TERM_COUNT] = [
     "Material",
     "PieceSq",
@@ -129,6 +133,10 @@ pub const TERM_NAMES: [&str; TERM_COUNT] = [
     "KingAttack",
     "Passers",
     "KingAct",
+    "Outposts",
+    "BadBishop",
+    "Trapped",
+    "Rook7th",
 ];
 
 /// Per-term MG/EG deltas, white − black. Built once per `breakdown()` call
@@ -294,6 +302,20 @@ pub fn breakdown(pos: &Position) -> EvalBreakdown {
     bd.term_mg[TERM_KING_ACT] = ka_mg;
     bd.term_eg[TERM_KING_ACT] = ka_eg;
 
+    // Piece depth (11d)
+    let (out_mg, out_eg) = pieces::outposts(pos);
+    bd.term_mg[TERM_OUTPOSTS] = out_mg;
+    bd.term_eg[TERM_OUTPOSTS] = out_eg;
+    let (bb_mg, bb_eg) = pieces::bad_bishop(pos);
+    bd.term_mg[TERM_BAD_BISHOP] = bb_mg;
+    bd.term_eg[TERM_BAD_BISHOP] = bb_eg;
+    let (trap_mg, trap_eg) = pieces::trapped(pos);
+    bd.term_mg[TERM_TRAPPED] = trap_mg;
+    bd.term_eg[TERM_TRAPPED] = trap_eg;
+    let (r7_mg, r7_eg) = pieces::rook_seventh(pos);
+    bd.term_mg[TERM_ROOK_7TH] = r7_mg;
+    bd.term_eg[TERM_ROOK_7TH] = r7_eg;
+
     bd
 }
 
@@ -336,9 +358,37 @@ fn evaluate_with_pawn(pos: &Position, cache: Option<&mut PawnCache>) -> i32 {
     let (shield_mg, shield_eg) = king::shield(pos);
     let (attack_mg, attack_eg) = king::attack(pos);
     let (ka_mg, ka_eg) = king::king_activity(pos);
+    let (out_mg, out_eg) = pieces::outposts(pos);
+    let (bb_mg, bb_eg) = pieces::bad_bishop(pos);
+    let (trap_mg, trap_eg) = pieces::trapped(pos);
+    let (r7_mg, r7_eg) = pieces::rook_seventh(pos);
 
-    let mg = psqt_mg + pawn_mg + pass_mg + mob_mg + rook_mg + bp_mg + shield_mg + attack_mg + ka_mg;
-    let eg = psqt_eg + pawn_eg + pass_eg + mob_eg + rook_eg + bp_eg + shield_eg + attack_eg + ka_eg;
+    let mg = psqt_mg
+        + pawn_mg
+        + pass_mg
+        + mob_mg
+        + rook_mg
+        + bp_mg
+        + shield_mg
+        + attack_mg
+        + ka_mg
+        + out_mg
+        + bb_mg
+        + trap_mg
+        + r7_mg;
+    let eg = psqt_eg
+        + pawn_eg
+        + pass_eg
+        + mob_eg
+        + rook_eg
+        + bp_eg
+        + shield_eg
+        + attack_eg
+        + ka_eg
+        + out_eg
+        + bb_eg
+        + trap_eg
+        + r7_eg;
     let white_score = (mg * phase + eg * (24 - phase)) / 24;
 
     let tempo_scaled = TEMPO_BONUS_MG * phase / 24;
