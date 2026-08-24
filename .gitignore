@@ -1,2 +1,10 @@
-/zig-out
-.zig-cache
+# Rust build artifacts
+/target
+
+# Local oracle engine binary (provided locally, never committed)
+/stockfish
+
+# Python (uv) tooling
+/tools/.venv/
+__pycache__/
+*.pyc
