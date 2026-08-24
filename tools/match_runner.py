@@ -479,7 +479,7 @@ async def run_match(args) -> int:
             options_b=args.option_b,
         )
 
-    # SPRT mode (existing)
+    # SPRT mode (concurrent, Part A)
     elo0 = args.elo0
     elo1 = args.elo1
     alpha = args.alpha
@@ -490,7 +490,7 @@ async def run_match(args) -> int:
     lower = math.log(beta / (1 - alpha))
     upper = math.log((1 - beta) / alpha)
     print(f"SPRT: elo0={elo0} elo1={elo1} alpha={alpha} beta={beta}")
-    print(f" bounds [{lower:.4f}, {upper:.4f}] movetime={movetime} max_games={max_games}")
+    print(f" bounds [{lower:.4f}, {upper:.4f}] movetime={movetime} max_games={max_games} concurrency={args.concurrency}")
     print(f" engines: A={engine_a} B={engine_b}")
 
     # Openings
@@ -532,98 +532,156 @@ async def run_match(args) -> int:
     games = 0
     pair_idx = 0
 
-    while games < max_games:
-        opening_fen, opening_moves = openings_norm[pair_idx % len(openings_norm)]
-        pair_idx += 1
+    # Sequential fallback (for --concurrency 1 or debugging): play pairs one at a time
+    # so the statistics are identical but slower. Default is concurrent batches.
+    sequential = getattr(args, "sequential", False) or args.concurrency <= 1
+    batch_pairs = max(1, args.concurrency) if not sequential else 1
 
-        # Game 1: A white, B black
+    async def _play_one(white_is_a: bool, fen: str | None, moves: list[str]) -> tuple[float, int]:
+        """Play one game, return (result_A, violations)."""
         if tc_base is not None:
-            r1_white, v1, _ = await play_single_game_clock(
-                engine_a, engine_b, opening_fen, opening_moves, tc_base, tc_inc or 0, engine_a, engine_b, args.elo_limit,
-                options_a=args.option_a, options_b=args.option_b, white_is_a=True,
-            )
-            # v1 counted as violations from engine A perspective already
+            if white_is_a:
+                r_w, v, _ = await play_single_game_clock(
+                    engine_a, engine_b, fen, moves, tc_base, tc_inc or 0, engine_a, engine_b, args.elo_limit,
+                    options_a=args.option_a, options_b=args.option_b, white_is_a=True,
+                )
+                return r_w, v
+            else:
+                r_w, v, _ = await play_single_game_clock(
+                    engine_b, engine_a, fen, moves, tc_base, tc_inc or 0, engine_a, engine_b, args.elo_limit,
+                    options_a=args.option_a, options_b=args.option_b, white_is_a=False,
+                )
+                if r_w == 1.0:
+                    return 0.0, v
+                elif r_w == 0.0:
+                    return 1.0, v
+                else:
+                    return 0.5, v
+        else:
+            if white_is_a:
+                r_w, v = await play_single_game(
+                    engine_a, engine_b, fen, moves, movetime, engine_a, engine_b, args.elo_limit,
+                    options_a=args.option_a, options_b=args.option_b, white_is_a=True,
+                )
+                return r_w, v
+            else:
+                r_w, v = await play_single_game(
+                    engine_b, engine_a, fen, moves, movetime, engine_a, engine_b, args.elo_limit,
+                    options_a=args.option_a, options_b=args.option_b, white_is_a=False,
+                )
+                if r_w == 1.0:
+                    return 0.0, v
+                elif r_w == 0.0:
+                    return 1.0, v
+                else:
+                    return 0.5, v
+
+    if sequential:
+        # Original sequential loop (single pair at a time) — preserves exact
+        # per-game print order for debugging.
+        while games < max_games:
+            opening_fen, opening_moves = openings_norm[pair_idx % len(openings_norm)]
+            pair_idx += 1
+
+            r1_A, v1 = await _play_one(True, opening_fen, opening_moves)
             if v1:
                 print(f"  WARNING: {v1} protocol violations by A in game {games+1}")
-        else:
-            r1_white, v1 = await play_single_game(
-                engine_a, engine_b, opening_fen, opening_moves, movetime, engine_a, engine_b, args.elo_limit,
-                options_a=args.option_a, options_b=args.option_b, white_is_a=True,
-            )
-        # Map to A perspective: A is White
-        r1_A = r1_white
-        games += 1
-        if r1_A == 1.0:
-            wins += 1
-        elif r1_A == 0.0:
-            losses += 1
-        else:
-            draws += 1
-        llr += llr_increment(r1_A, elo0, elo1)
-        elo, err = elo_estimate(wins, draws, losses)
-        score = (wins + 0.5 * draws) / games if games else 0
-        v = "H1" if llr >= upper else ("H0" if llr <= lower else "")
-        print(
-            f"games {games:4}: W {wins:3} D {draws:3} L {losses:3} "
-            f"score {score*100:5.1f}% elo {elo:+6.1f} ±{err:4.1f} llr {llr:+6.2f} {v}"
-        )
-        if llr >= upper:
-            print(f"SPRT: H1 accepted (elo1={elo1}) after {games} games")
-            return 0
-        if llr <= lower:
-            print(f"SPRT: H0 accepted (elo0={elo0}) after {games} games")
-            return 1
-        if games >= max_games:
-            break
+            games += 1
+            if r1_A == 1.0:
+                wins += 1
+            elif r1_A == 0.0:
+                losses += 1
+            else:
+                draws += 1
+            llr += llr_increment(r1_A, elo0, elo1)
+            elo, err = elo_estimate(wins, draws, losses)
+            score = (wins + 0.5 * draws) / games if games else 0
+            v = "H1" if llr >= upper else ("H0" if llr <= lower else "")
+            print(f"games {games:4}: W {wins:3} D {draws:3} L {losses:3} score {score*100:5.1f}% elo {elo:+6.1f} ±{err:4.1f} llr {llr:+6.2f} {v}")
+            if llr >= upper:
+                print(f"SPRT: H1 accepted (elo1={elo1}) after {games} games")
+                return 0
+            if llr <= lower:
+                print(f"SPRT: H0 accepted (elo0={elo0}) after {games} games")
+                return 1
+            if games >= max_games:
+                break
 
-        # Game 2: B white, A black (same opening, colors swapped)
-        if tc_base is not None:
-            r2_white, v2, _ = await play_single_game_clock(
-                engine_b, engine_a, opening_fen, opening_moves, tc_base, tc_inc or 0, engine_a, engine_b, args.elo_limit,
-                options_a=args.option_a, options_b=args.option_b, white_is_a=False,
-            )
-        else:
-            r2_white, v2 = await play_single_game(
-                engine_b, engine_a, opening_fen, opening_moves, movetime, engine_a, engine_b, args.elo_limit,
-                options_a=args.option_a, options_b=args.option_b, white_is_a=False,
-            )
-        # A is Black, so invert (draw stays 0.5)
-        if r2_white == 1.0:
-            r2_A = 0.0
-        elif r2_white == 0.0:
-            r2_A = 1.0
-        else:
-            r2_A = 0.5
-        games += 1
-        if r2_A == 1.0:
-            wins += 1
-        elif r2_A == 0.0:
-            losses += 1
-        else:
-            draws += 1
-        llr += llr_increment(r2_A, elo0, elo1)
-        elo, err = elo_estimate(wins, draws, losses)
-        score = (wins + 0.5 * draws) / games if games else 0
-        v = "H1" if llr >= upper else ("H0" if llr <= lower else "")
-        print(
-            f"games {games:4}: W {wins:3} D {draws:3} L {losses:3} "
-            f"score {score*100:5.1f}% elo {elo:+6.1f} ±{err:4.1f} llr {llr:+6.2f} {v}"
-        )
-        if llr >= upper:
-            print(f"SPRT: H1 accepted (elo1={elo1}) after {games} games")
-            return 0
-        if llr <= lower:
-            print(f"SPRT: H0 accepted (elo0={elo0}) after {games} games")
-            return 1
+            r2_A, v2 = await _play_one(False, opening_fen, opening_moves)
+            if v2:
+                print(f"  WARNING: {v2} protocol violations by A in game {games+1}")
+            games += 1
+            if r2_A == 1.0:
+                wins += 1
+            elif r2_A == 0.0:
+                losses += 1
+            else:
+                draws += 1
+            llr += llr_increment(r2_A, elo0, elo1)
+            elo, err = elo_estimate(wins, draws, losses)
+            score = (wins + 0.5 * draws) / games if games else 0
+            v = "H1" if llr >= upper else ("H0" if llr <= lower else "")
+            print(f"games {games:4}: W {wins:3} D {draws:3} L {losses:3} score {score*100:5.1f}% elo {elo:+6.1f} ±{err:4.1f} llr {llr:+6.2f} {v}")
+            if llr >= upper:
+                print(f"SPRT: H1 accepted (elo1={elo1}) after {games} games")
+                return 0
+            if llr <= lower:
+                print(f"SPRT: H0 accepted (elo0={elo0}) after {games} games")
+                return 1
+    else:
+        # Concurrent batched loop — play batch_pairs pairs (2*batch_pairs games) at once
+        while games < max_games:
+            remaining_pairs = (max_games - games + 1) // 2
+            if remaining_pairs <= 0:
+                break
+            cur_batch_pairs = min(batch_pairs, remaining_pairs)
+            batch_openings: list[tuple[str | None, list[str]]] = []
+            for _ in range(cur_batch_pairs):
+                batch_openings.append(openings_norm[pair_idx % len(openings_norm)])
+                pair_idx += 1
+
+            # Build tasks: two games per opening (A white, B white)
+            tasks: list[asyncio.Task] = []
+            for fen, moves in batch_openings:
+                tasks.append(asyncio.create_task(_play_one(True, fen, moves)))
+                tasks.append(asyncio.create_task(_play_one(False, fen, moves)))
+            # Clamp to max_games if cap is odd (truncate last game's second color)
+            remaining = max_games - games
+            if len(tasks) > remaining:
+                for t in tasks[remaining:]:
+                    t.cancel()
+                tasks = tasks[:remaining]
+
+            batch_results = await asyncio.gather(*tasks)
+            # Batch results are [A_white, B_white, A_white, B_white, ...]; update sequentially
+            for rA, v in batch_results:
+                if v:
+                    print(f"  WARNING: {v} protocol violations by A in game {games+1}")
+                games += 1
+                if rA == 1.0:
+                    wins += 1
+                elif rA == 0.0:
+                    losses += 1
+                else:
+                    draws += 1
+                llr += llr_increment(rA, elo0, elo1)
+
+            elo, err = elo_estimate(wins, draws, losses)
+            score = (wins + 0.5 * draws) / games if games else 0
+            v = "H1" if llr >= upper else ("H0" if llr <= lower else "")
+            print(f"games {games:4}: W {wins:3} D {draws:3} L {losses:3} score {score*100:5.1f}% elo {elo:+6.1f} ±{err:4.1f} llr {llr:+6.2f} {v} [batch {cur_batch_pairs} pairs]")
+            if llr >= upper:
+                print(f"SPRT: H1 accepted (elo1={elo1}) after {games} games")
+                return 0
+            if llr <= lower:
+                print(f"SPRT: H0 accepted (elo0={elo0}) after {games} games")
+                return 1
 
     print(f"SPRT: undecided after {games} games (cap {max_games})")
     elo, err = elo_estimate(wins, draws, losses)
     print(f" final: W{wins} D{draws} L{losses} elo {elo:+.1f} ±{err:.1f} llr {llr:.2f}")
-    # For the SPRT gate, a positive elo with undecided still counts as "shows gain"
-    # if wins > losses significantly. We return 0 if elo > 10, 2 otherwise.
-    if elo > 10 and wins > losses:
-        print(" Positive elo at cap — treating as H1 for gate")
-        return 0
+    # Undecided = do-not-land (exit 2). Caller decides whether to treat as
+    # "close enough" via its own threshold; the gate (A.4) requires H1.
     return 2
 
 
@@ -826,7 +884,8 @@ def main() -> None:
     parser.add_argument("--elo-limit", type=int, default=None, help="UCI_Elo for engine B (with UCI_LimitStrength)")
     parser.add_argument("--sweep", type=str, default=None, help="comma-separated Elo levels for rating sweep vs engine B (e.g. 1320,1500,1750)")
     parser.add_argument("--max-games", type=int, default=200, help="cap")
-    parser.add_argument("--concurrency", type=int, default=5, help="parallel game pairs")
+    parser.add_argument("--concurrency", type=int, default=5, help="parallel game pairs (SPRT batches; fixed-gate parallel games)")
+    parser.add_argument("--sequential", action="store_true", help="force sequential SPRT (debug; default is concurrent batches)")
     parser.add_argument("--openings", default="default", help="'default' or path to FEN file")
     parser.add_argument("--option-a", action="append", default=None, help="setoption for engine A, Name=Value (repeatable, e.g. Threads=4)")
     parser.add_argument("--option-b", action="append", default=None, help="setoption for engine B, Name=Value (repeatable)")

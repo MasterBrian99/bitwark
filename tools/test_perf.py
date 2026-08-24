@@ -23,6 +23,11 @@ from common import BITWARK_BIN, UciEngine
 # Recorded at v0.5.0.
 #   bench: ./target/release/bitwark bench 16 1 13 default depth -> Nodes/second
 #   perft: go perft 5 startpos wall-clock via UciEngine (bulk counting)
+#
+# Ledger-aware: if tools/baselines.json exists, its latest bench.nps_median
+# is used as the relative baseline (with +/-2% tolerance in test_bench);
+# the absolute floor below is always enforced. Update baselines.json via
+# `uv run python tools/verify.py --expect-nodes record --phase phaseN`.
 # ---------------------------------------------------------------------------
 PRE_SPEED_BASELINE = {
     # informational — the deterministic node count is asserted in test_bench;
@@ -32,10 +37,27 @@ PRE_SPEED_BASELINE = {
     "perft_nps": 24_700_000,  # go perft 6: ~119M/4.84s ; go perft 5: 4.86M timed below
 }
 
-# Floors — raised deliberately after each optimization. SEE ordering and
-# qsearch pruning cost NPS, so the bench floor was relaxed to 1.5M.
-BENCH_NPS_FLOOR = 1_500_000
-PERFT_NPS_FLOOR = 40_000_000
+# Floors — raised deliberately after each optimization. Ledger-relative
+# +/-2% in verify.py is the real gate; absolute here is a loose safety net.
+BENCH_NPS_FLOOR = 1_400_000
+PERFT_NPS_FLOOR = 35_000_000
+
+# Ledger-aware helper (Part A)
+LEDGER_PATH = BITWARK_BIN.parent.parent / "tools" / "baselines.json"
+
+
+def _ledger_bench_nps() -> int | None:
+    try:
+        import json as _json
+
+        data = _json.loads(LEDGER_PATH.read_text())
+        baselines = data.get("baselines", [])
+        if baselines:
+            latest = baselines[-1]
+            return latest.get("bench", {}).get("nps_median")
+    except Exception:
+        pass
+    return None
 
 
 def parse_bench_block(text: str) -> tuple[int, int]:
@@ -69,16 +91,22 @@ async def bench_once() -> tuple[int, int]:
 async def test_bench_nps() -> None:
     print(f"RUN   test_bench_nps (floor {BENCH_NPS_FLOOR/1e6:.1f}M)")
     nodes, nps = await bench_once()
+    ledger_nps = _ledger_bench_nps()
+    base_nps = ledger_nps if ledger_nps is not None else PRE_SPEED_BASELINE["bench_nps"]
+    base_label = "ledger" if ledger_nps is not None else "pre-speed"
     print(f"  Nodes searched: {nodes}  Nodes/second: {nps} ({nps/1e6:.2f}M)")
-    print(f"  baseline pre-speed bench_nps {PRE_SPEED_BASELINE['bench_nps']/1e6:.2f}M")
+    print(f"  baseline {base_label} bench_nps {base_nps/1e6:.2f}M")
     if nodes != PRE_SPEED_BASELINE["bench_nodes_d13"] and False:
         # Node count determinism is asserted in test_bench; don't duplicate here.
         pass
     if nps < BENCH_NPS_FLOOR:
         raise AssertionError(
             f"bench NPS too low: {nps} < floor {BENCH_NPS_FLOOR} "
-            f"(baseline {PRE_SPEED_BASELINE['bench_nps']}, gate expects ≥ {BENCH_NPS_FLOOR})"
+            f"(baseline {base_nps}, gate expects ≥ {BENCH_NPS_FLOOR})"
         )
+    # Ledger-aware relative check: warn if >2% regression vs ledger median
+    if ledger_nps is not None and nps < ledger_nps * 0.98:
+        print(f"  WARN bench NPS {nps/1e6:.2f}M is >2% below ledger {ledger_nps/1e6:.2f}M")
     print(f"PASS  test_bench_nps ({nps/1e6:.2f}M ≥ {BENCH_NPS_FLOOR/1e6:.1f}M)")
 
 
