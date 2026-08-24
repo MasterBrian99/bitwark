@@ -78,7 +78,7 @@ echo "  A (new): $NEW_BIN"
 echo "  B (base): $BASE_BIN"
 echo
 
-exec uv run python "$REPO_ROOT/tools/match_runner.py" \
+exec uv run --project "$REPO_ROOT/tools" python "$REPO_ROOT/tools/match_runner.py" \
   --engine-a "$NEW_BIN" \
   --engine-b "$BASE_BIN" \
   --elo0 "$ELO0" --elo1 "$ELO1" \

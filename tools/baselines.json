@@ -36,6 +36,24 @@
         "startpos_d5": 4865609,
         "kiwipete_d4": 4085603,
         "ok": true
+      },
+      "elo_anchor": {
+        "date": "2026-08-24T16:15:00+00:00",
+        "movetime": 300,
+        "concurrency": 6,
+        "openings": "tools/data/openings.txt (123 lines)",
+        "stockfish": "Stockfish dev-20260803-762dd1da",
+        "levels": [
+          {"elo": 1320, "W": 19, "D": 1, "L": 0, "elo_est": 636.4, "err": 340.4},
+          {"elo": 1500, "W": 18, "D": 2, "L": 0, "elo_est": 511.5, "err": 240.4},
+          {"elo": 1750, "W": 17, "D": 2, "L": 1, "elo_est": 381.7, "err": 215.7},
+          {"elo": 2000, "W": 16, "D": 3, "L": 1, "elo_est": 338.0, "err": 186.6},
+          {"elo": 2200, "W": 13, "D": 7, "L": 0, "elo_est": 269.4, "err": 125.8},
+          {"elo": 2400, "W": 10, "D": 7, "L": 3, "elo_est": 127.0, "err": 126.0},
+          {"elo": 2600, "W": 6, "D": 8, "L": 6, "elo_est": 0.0, "err": 117.9}
+        ],
+        "estimate": "~2600 (even with SF 2600 at movetime 300, 20 games/level)",
+        "note": "Fixed-gate mode, paired openings, 20 games per level. Positive elo_est means bitwark stronger than that SF Elo limit."
       }
     }
   ]
