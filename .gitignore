@@ -4,7 +4,15 @@
 # Local oracle engine binary (provided locally, never committed)
 /stockfish
 
+# Phase baseline binaries (machine-specific, rebuilt from git tags)
+# Ledger is tools/baselines.json; binaries live in tools/baselines/phaseN
+/tools/baselines/phase*
+!/tools/baselines/.gitkeep
+
 # Python (uv) tooling
 /tools/.venv/
 __pycache__/
 *.pyc
+
+# Local plan file (not committed)
+/PLAN.md
