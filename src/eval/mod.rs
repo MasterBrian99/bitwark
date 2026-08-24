@@ -24,7 +24,7 @@
 //! Pawn structure, mobility/rook files/bishop pair, and king safety each contribute MG/EG deltas to the same
 //! interpolated total.
 
-use crate::board::{Bitboard, Color, Piece, PieceType, Position};
+use crate::board::{Color, Piece, PieceType, Position};
 
 pub mod king;
 pub mod pawns;
@@ -33,15 +33,11 @@ pub mod tables;
 
 /// Pawn structure cache — direct-mapped, keyed by pawn_hash.
 /// Pure function cache: a miss recomputes, a collision overwrites.
-/// Stores pawn-structure mg/eg plus passer bitboards (pawn-vs-pawn only,
-/// hence cache-pure); passer scoring (king-dependent) lives outside the cache.
 #[derive(Clone, Copy, Debug)]
 struct PawnEntry {
     key: u64,
     mg: i32,
     eg: i32,
-    w_passers: u64,
-    b_passers: u64,
 }
 
 pub struct PawnCache {
@@ -51,15 +47,13 @@ pub struct PawnCache {
 
 impl PawnCache {
     pub fn new() -> Self {
-        let size = 1 << 14; // 16384 entries × ~32 bytes = 512 KiB
+        let size = 1 << 14; // 16384 entries × ~16 bytes = 256 KiB
         Self {
             entries: vec![
                 PawnEntry {
                     key: 0,
                     mg: 0,
-                    eg: 0,
-                    w_passers: 0,
-                    b_passers: 0,
+                    eg: 0
                 };
                 size
             ],
@@ -68,25 +62,19 @@ impl PawnCache {
     }
 
     #[inline]
-    pub fn probe(&self, key: u64) -> Option<(i32, i32, Bitboard, Bitboard)> {
+    pub fn probe(&self, key: u64) -> Option<(i32, i32)> {
         let e = &self.entries[(key as usize) & self.mask];
         if e.key == key {
-            Some((e.mg, e.eg, Bitboard(e.w_passers), Bitboard(e.b_passers)))
+            Some((e.mg, e.eg))
         } else {
             None
         }
     }
 
     #[inline]
-    pub fn store(&mut self, key: u64, mg: i32, eg: i32, w: Bitboard, b: Bitboard) {
+    pub fn store(&mut self, key: u64, mg: i32, eg: i32) {
         let idx = (key as usize) & self.mask;
-        self.entries[idx] = PawnEntry {
-            key,
-            mg,
-            eg,
-            w_passers: w.0,
-            b_passers: b.0,
-        };
+        self.entries[idx] = PawnEntry { key, mg, eg };
     }
 }
 
@@ -107,21 +95,14 @@ impl Default for PawnCache {
 pub const TEMPO_BONUS_MG: i32 = 10;
 
 /// Number of scored terms.
-pub const TERM_COUNT: usize = 14;
+pub const TERM_COUNT: usize = 7;
 pub const TERM_MATERIAL: usize = 0;
 pub const TERM_PST: usize = 1;
 pub const TERM_PAWN: usize = 2;
 pub const TERM_MOBILITY: usize = 3;
 pub const TERM_ROOK: usize = 4;
 pub const TERM_BISHOP_PAIR: usize = 5;
-pub const TERM_KING_SHIELD: usize = 6;
-pub const TERM_KING_ATTACK: usize = 7;
-pub const TERM_PASSERS: usize = 8;
-pub const TERM_KING_ACT: usize = 9;
-pub const TERM_OUTPOSTS: usize = 10;
-pub const TERM_BAD_BISHOP: usize = 11;
-pub const TERM_TRAPPED: usize = 12;
-pub const TERM_ROOK_7TH: usize = 13;
+pub const TERM_KING: usize = 6;
 pub const TERM_NAMES: [&str; TERM_COUNT] = [
     "Material",
     "PieceSq",
@@ -129,19 +110,12 @@ pub const TERM_NAMES: [&str; TERM_COUNT] = [
     "Mobility",
     "RookFiles",
     "BishopPair",
-    "KingShield",
-    "KingAttack",
-    "Passers",
-    "KingAct",
-    "Outposts",
-    "BadBishop",
-    "Trapped",
-    "Rook7th",
+    "KingSafety",
 ];
 
 /// Per-term MG/EG deltas, white − black. Built once per `breakdown()` call
 /// and used both by `evaluate()` (search) and the `eval` debug command.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct EvalBreakdown {
     /// Game phase 0..24 (24 = middlegame, 0 = endgame).
     pub phase: i32,
@@ -149,19 +123,6 @@ pub struct EvalBreakdown {
     pub term_mg: [i32; TERM_COUNT],
     /// Per-term EG deltas.
     pub term_eg: [i32; TERM_COUNT],
-    /// Draw scaling factor 0..64 (64 = no scaling).
-    pub scale: i32,
-}
-
-impl Default for EvalBreakdown {
-    fn default() -> Self {
-        Self {
-            phase: 0,
-            term_mg: [0; TERM_COUNT],
-            term_eg: [0; TERM_COUNT],
-            scale: 64,
-        }
-    }
 }
 
 impl EvalBreakdown {
@@ -174,13 +135,11 @@ impl EvalBreakdown {
         self.term_eg.iter().sum()
     }
     /// White-perspective interpolated score (no tempo, no stm negation).
-    /// Scaled by `scale` toward 0 in drawish endgames.
     #[inline]
     pub fn white_score(&self) -> i32 {
         let mg = self.mg();
         let eg = self.eg();
-        let raw = (mg * self.phase + eg * (24 - self.phase)) / 24;
-        raw * self.scale / 64
+        (mg * self.phase + eg * (24 - self.phase)) / 24
     }
 }
 
@@ -205,175 +164,6 @@ pub fn game_phase(pos: &Position) -> i32 {
             * tables::PHASE_WEIGHT[PieceType::Queen as usize];
     }
     phase.min(24)
-}
-
-/// Draw scaling factor 0..64 (64 = no scaling).
-pub fn scale_factor(pos: &Position) -> i32 {
-    if is_ocb(pos) {
-        return 32;
-    }
-    if is_kminor_vs_k(pos) || is_k2n_vs_k(pos) {
-        return 0;
-    }
-    if is_rook_pawns_one_side(pos) {
-        return 36;
-    }
-    64
-}
-
-fn is_ocb(pos: &Position) -> bool {
-    // Only bishops (plus kings/pawns) remain, at least one bishop each, opposite colors.
-    let has_knight = !pos
-        .pieces_bb(Piece::new(Color::White, PieceType::Knight))
-        .is_empty()
-        || !pos
-            .pieces_bb(Piece::new(Color::Black, PieceType::Knight))
-            .is_empty();
-    let has_rook = !pos
-        .pieces_bb(Piece::new(Color::White, PieceType::Rook))
-        .is_empty()
-        || !pos
-            .pieces_bb(Piece::new(Color::Black, PieceType::Rook))
-            .is_empty();
-    let has_queen = !pos
-        .pieces_bb(Piece::new(Color::White, PieceType::Queen))
-        .is_empty()
-        || !pos
-            .pieces_bb(Piece::new(Color::Black, PieceType::Queen))
-            .is_empty();
-    if has_knight || has_rook || has_queen {
-        return false;
-    }
-    let w_bishops = pos.pieces_bb(Piece::new(Color::White, PieceType::Bishop));
-    let b_bishops = pos.pieces_bb(Piece::new(Color::Black, PieceType::Bishop));
-    if w_bishops.is_empty() || b_bishops.is_empty() {
-        return false;
-    }
-    // Check opposite colors: get first bishop each.
-    let wb = w_bishops.squares().next().unwrap();
-    let bb = b_bishops.squares().next().unwrap();
-    let wb_light = (wb.file() as i32 + wb.rank() as i32) % 2 == 1;
-    let bb_light = (bb.file() as i32 + bb.rank() as i32) % 2 == 1;
-    wb_light != bb_light
-}
-
-fn is_kminor_vs_k(pos: &Position) -> bool {
-    let has_pawns = !pos
-        .pieces_bb(Piece::new(Color::White, PieceType::Pawn))
-        .is_empty()
-        || !pos
-            .pieces_bb(Piece::new(Color::Black, PieceType::Pawn))
-            .is_empty();
-    if has_pawns {
-        return false;
-    }
-    let w_minor = pos
-        .pieces_bb(Piece::new(Color::White, PieceType::Knight))
-        .count()
-        + pos
-            .pieces_bb(Piece::new(Color::White, PieceType::Bishop))
-            .count();
-    let b_minor = pos
-        .pieces_bb(Piece::new(Color::Black, PieceType::Knight))
-        .count()
-        + pos
-            .pieces_bb(Piece::new(Color::Black, PieceType::Bishop))
-            .count();
-    let w_has_major = !pos
-        .pieces_bb(Piece::new(Color::White, PieceType::Rook))
-        .is_empty()
-        || !pos
-            .pieces_bb(Piece::new(Color::White, PieceType::Queen))
-            .is_empty();
-    let b_has_major = !pos
-        .pieces_bb(Piece::new(Color::Black, PieceType::Rook))
-        .is_empty()
-        || !pos
-            .pieces_bb(Piece::new(Color::Black, PieceType::Queen))
-            .is_empty();
-    if w_has_major || b_has_major {
-        return false;
-    }
-    // Exactly one side has single minor, other bare king.
-    (w_minor == 1 && b_minor == 0) || (b_minor == 1 && w_minor == 0)
-}
-
-fn is_k2n_vs_k(pos: &Position) -> bool {
-    let has_pawns = !pos
-        .pieces_bb(Piece::new(Color::White, PieceType::Pawn))
-        .is_empty()
-        || !pos
-            .pieces_bb(Piece::new(Color::Black, PieceType::Pawn))
-            .is_empty();
-    if has_pawns {
-        return false;
-    }
-    let w_has_other = !pos
-        .pieces_bb(Piece::new(Color::White, PieceType::Bishop))
-        .is_empty()
-        || !pos
-            .pieces_bb(Piece::new(Color::White, PieceType::Rook))
-            .is_empty()
-        || !pos
-            .pieces_bb(Piece::new(Color::White, PieceType::Queen))
-            .is_empty();
-    let b_has_other = !pos
-        .pieces_bb(Piece::new(Color::Black, PieceType::Bishop))
-        .is_empty()
-        || !pos
-            .pieces_bb(Piece::new(Color::Black, PieceType::Rook))
-            .is_empty()
-        || !pos
-            .pieces_bb(Piece::new(Color::Black, PieceType::Queen))
-            .is_empty();
-    if w_has_other || b_has_other {
-        return false;
-    }
-    let w_knights = pos
-        .pieces_bb(Piece::new(Color::White, PieceType::Knight))
-        .count();
-    let b_knights = pos
-        .pieces_bb(Piece::new(Color::Black, PieceType::Knight))
-        .count();
-    (w_knights == 2 && b_knights == 0) || (b_knights == 2 && w_knights == 0)
-}
-
-fn is_rook_pawns_one_side(pos: &Position) -> bool {
-    // Only rooks (plus kings/pawns) remain.
-    let has_other = !pos
-        .pieces_bb(Piece::new(Color::White, PieceType::Knight))
-        .is_empty()
-        || !pos
-            .pieces_bb(Piece::new(Color::Black, PieceType::Knight))
-            .is_empty()
-        || !pos
-            .pieces_bb(Piece::new(Color::White, PieceType::Bishop))
-            .is_empty()
-        || !pos
-            .pieces_bb(Piece::new(Color::Black, PieceType::Bishop))
-            .is_empty()
-        || !pos
-            .pieces_bb(Piece::new(Color::White, PieceType::Queen))
-            .is_empty()
-        || !pos
-            .pieces_bb(Piece::new(Color::Black, PieceType::Queen))
-            .is_empty();
-    if has_other {
-        return false;
-    }
-    // Collect pawn files.
-    let mut files: Vec<u8> = Vec::new();
-    for &color in &[Color::White, Color::Black] {
-        for sq in pos.pieces_bb(Piece::new(color, PieceType::Pawn)).squares() {
-            files.push(sq.file());
-        }
-    }
-    if files.is_empty() {
-        return false;
-    }
-    let all_left = files.iter().all(|&f| f <= 3);
-    let all_right = files.iter().all(|&f| f >= 4);
-    all_left || all_right
 }
 
 // ---------------------------------------------------------------------------
@@ -452,13 +242,10 @@ pub fn breakdown(pos: &Position) -> EvalBreakdown {
         }
     }
 
-    // Pawn structure (5b) + 11b passers split
-    let (pawn_mg, pawn_eg, w_pass, b_pass) = pawns::pawn_structure_and_passers(pos);
+    // Pawn structure (5b)
+    let (pawn_mg, pawn_eg) = pawns::eval(pos);
     bd.term_mg[TERM_PAWN] = pawn_mg;
     bd.term_eg[TERM_PAWN] = pawn_eg;
-    let (pass_mg, pass_eg) = pawns::passer_score(pos, w_pass, b_pass);
-    bd.term_mg[TERM_PASSERS] = pass_mg;
-    bd.term_eg[TERM_PASSERS] = pass_eg;
 
     // Piece terms (5c)
     let (mob_mg, mob_eg) = pieces::mobility(pos);
@@ -473,35 +260,10 @@ pub fn breakdown(pos: &Position) -> EvalBreakdown {
     bd.term_mg[TERM_BISHOP_PAIR] = bp_mg;
     bd.term_eg[TERM_BISHOP_PAIR] = bp_eg;
 
-    // King safety (5d -> 11a split)
-    let (shield_mg, shield_eg) = king::shield(pos);
-    bd.term_mg[TERM_KING_SHIELD] = shield_mg;
-    bd.term_eg[TERM_KING_SHIELD] = shield_eg;
-    let (attack_mg, attack_eg) = king::attack(pos);
-    bd.term_mg[TERM_KING_ATTACK] = attack_mg;
-    bd.term_eg[TERM_KING_ATTACK] = attack_eg;
-
-    // King activity (11b EG)
-    let (ka_mg, ka_eg) = king::king_activity(pos);
-    bd.term_mg[TERM_KING_ACT] = ka_mg;
-    bd.term_eg[TERM_KING_ACT] = ka_eg;
-
-    // Piece depth (11d)
-    let (out_mg, out_eg) = pieces::outposts(pos);
-    bd.term_mg[TERM_OUTPOSTS] = out_mg;
-    bd.term_eg[TERM_OUTPOSTS] = out_eg;
-    let (bb_mg, bb_eg) = pieces::bad_bishop(pos);
-    bd.term_mg[TERM_BAD_BISHOP] = bb_mg;
-    bd.term_eg[TERM_BAD_BISHOP] = bb_eg;
-    let (trap_mg, trap_eg) = pieces::trapped(pos);
-    bd.term_mg[TERM_TRAPPED] = trap_mg;
-    bd.term_eg[TERM_TRAPPED] = trap_eg;
-    let (r7_mg, r7_eg) = pieces::rook_seventh(pos);
-    bd.term_mg[TERM_ROOK_7TH] = r7_mg;
-    bd.term_eg[TERM_ROOK_7TH] = r7_eg;
-
-    // Draw scaling (11e).
-    bd.scale = scale_factor(pos);
+    // King safety (5d)
+    let (king_mg, king_eg) = king::eval(pos);
+    bd.term_mg[TERM_KING] = king_mg;
+    bd.term_eg[TERM_KING] = king_eg;
 
     bd
 }
@@ -526,59 +288,26 @@ fn evaluate_with_pawn(pos: &Position, cache: Option<&mut PawnCache>) -> i32 {
     let psqt_mg = pos.psqt_mg();
     let psqt_eg = pos.psqt_eg();
 
-    let (pawn_mg, pawn_eg, w_pass, b_pass) = if let Some(c) = cache {
-        if let Some((mg, eg, w, b)) = c.probe(pos.pawn_hash()) {
-            (mg, eg, w, b)
+    let (pawn_mg, pawn_eg) = if let Some(c) = cache {
+        if let Some((mg, eg)) = c.probe(pos.pawn_hash()) {
+            (mg, eg)
         } else {
-            let (mg, eg, w, b) = pawns::pawn_structure_and_passers(pos);
-            c.store(pos.pawn_hash(), mg, eg, w, b);
-            (mg, eg, w, b)
+            let (mg, eg) = pawns::eval(pos);
+            c.store(pos.pawn_hash(), mg, eg);
+            (mg, eg)
         }
     } else {
-        pawns::pawn_structure_and_passers(pos)
+        pawns::eval(pos)
     };
-    let (pass_mg, pass_eg) = pawns::passer_score(pos, w_pass, b_pass);
 
     let (mob_mg, mob_eg) = pieces::mobility(pos);
     let (rook_mg, rook_eg) = pieces::rook_files(pos);
     let (bp_mg, bp_eg) = pieces::bishop_pair(pos);
-    let (shield_mg, shield_eg) = king::shield(pos);
-    let (attack_mg, attack_eg) = king::attack(pos);
-    let (ka_mg, ka_eg) = king::king_activity(pos);
-    let (out_mg, out_eg) = pieces::outposts(pos);
-    let (bb_mg, bb_eg) = pieces::bad_bishop(pos);
-    let (trap_mg, trap_eg) = pieces::trapped(pos);
-    let (r7_mg, r7_eg) = pieces::rook_seventh(pos);
+    let (king_mg, king_eg) = king::eval(pos);
 
-    let mg = psqt_mg
-        + pawn_mg
-        + pass_mg
-        + mob_mg
-        + rook_mg
-        + bp_mg
-        + shield_mg
-        + attack_mg
-        + ka_mg
-        + out_mg
-        + bb_mg
-        + trap_mg
-        + r7_mg;
-    let eg = psqt_eg
-        + pawn_eg
-        + pass_eg
-        + mob_eg
-        + rook_eg
-        + bp_eg
-        + shield_eg
-        + attack_eg
-        + ka_eg
-        + out_eg
-        + bb_eg
-        + trap_eg
-        + r7_eg;
-    let scale = scale_factor(pos);
-    let raw = (mg * phase + eg * (24 - phase)) / 24;
-    let white_score = raw * scale / 64;
+    let mg = psqt_mg + pawn_mg + mob_mg + rook_mg + bp_mg + king_mg;
+    let eg = psqt_eg + pawn_eg + mob_eg + rook_eg + bp_eg + king_eg;
+    let white_score = (mg * phase + eg * (24 - phase)) / 24;
 
     let tempo_scaled = TEMPO_BONUS_MG * phase / 24;
     let white_pov = white_score
@@ -677,9 +406,8 @@ mod tests {
 
     #[test]
     fn knight_center_vs_rim() {
-        // Keep material non-trivial so draw scaling doesn't mask PST.
-        let fen_center = "4k3/8/8/8/3N4/3P4/2P5/4K3 w - - 0 1";
-        let fen_rim = "4k3/8/8/8/8/8/2P5/N3K3 w - - 0 1";
+        let fen_center = "4k3/8/8/8/3N4/8/8/4K3 w - - 0 1";
+        let fen_rim = "4k3/8/8/8/8/8/8/N3K3 w - - 0 1";
         let pos_c = parse_fen(fen_center).unwrap();
         let pos_r = parse_fen(fen_rim).unwrap();
         assert!(
@@ -737,88 +465,5 @@ mod tests {
         // 6 white queens (phase 24, clamped)
         let pos5 = parse_fen("QQQ5/QQQ5/8/8/8/8/8/4K2k w - - 0 1").unwrap();
         assert_eq!(game_phase(&pos5), 24); // 6 queens = 24, clamped
-    }
-
-    #[test]
-    fn evaluate_matches_breakdown() {
-        let fens = [
-            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
-            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
-            "r1bq1rk1/pp2ppbp/2np1np1/2p5/2P1P3/1PN1B3/PB1Q1PPP/R3K2R w KQ - 0 1",
-            "4k3/8/8/8/3P4/8/8/4K3 w - - 0 1",
-            "4k3/8/8/4q3/2b5/8/8/4K3 w - - 0 1",
-            "4k3/8/8/8/8/8/5PPP/5RK1 w - - 0 1",
-            "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1",
-            "4k3/3P4/8/8/8/8/8/4K3 w - - 0 1",
-        ];
-        for fen in fens {
-            let pos = parse_fen(fen).unwrap();
-            let bd = breakdown(&pos);
-            let white_score = bd.white_score();
-            let tempo_scaled = TEMPO_BONUS_MG * bd.phase / 24;
-            let white_pov = white_score
-                + if pos.side_to_move() == Color::White {
-                    tempo_scaled
-                } else {
-                    -tempo_scaled
-                };
-            let stm_via_bd = if pos.side_to_move() == Color::White {
-                white_pov
-            } else {
-                -white_pov
-            };
-            let ev = evaluate(&pos);
-            assert_eq!(
-                ev, stm_via_bd,
-                "evaluate vs breakdown mismatch for {fen}: ev={ev} bd_stm={stm_via_bd} bd={bd:?}"
-            );
-            // Cached path must match too.
-            let mut cache = PawnCache::new();
-            let ev_cached = evaluate_cached(&pos, &mut cache);
-            assert_eq!(
-                ev_cached, ev,
-                "cached vs uncached mismatch for {fen}: cached={ev_cached} ev={ev}"
-            );
-        }
-    }
-
-    #[test]
-    fn ocb_scaling() {
-        // OCB: only bishops opposite colors (c1 dark vs c2 light)
-        let pos_ocb = parse_fen("4k3/8/8/8/8/8/2b5/2B1K3 w - - 0 1").unwrap();
-        let pos_same = parse_fen("4k3/8/8/8/8/8/2b5/1B2K3 w - - 0 1").unwrap();
-        let s_ocb = scale_factor(&pos_ocb);
-        let s_same = scale_factor(&pos_same);
-        assert_eq!(s_ocb, 32, "OCB should be 32");
-        assert_eq!(s_same, 64, "same color bishops should be 64");
-        // Scale halves eval
-        let pos_ocb2 = parse_fen("4k3/8/3b4/8/4B3/8/8/4K3 w - - 0 1").unwrap(); // d6 dark, e4 light -> opposite
-        let ev_ocb = evaluate(&pos_ocb2).abs();
-        assert!(ev_ocb >= 0, "ocb eval {ev_ocb}");
-    }
-
-    #[test]
-    fn kminor_vs_k_draw() {
-        let pos = parse_fen("4k3/8/8/8/8/8/8/4KN2 w - - 0 1").unwrap(); // K+N vs K
-        let s = scale_factor(&pos);
-        println!("kminor scale {s} w_minor check");
-        assert_eq!(s, 0);
-        assert!(
-            evaluate(&pos).abs() < 50,
-            "K+N vs K should be near 0 got {}",
-            evaluate(&pos)
-        );
-        let pos2 = parse_fen("4k3/8/8/8/8/8/8/2NNK3 w - - 0 1").unwrap(); // K+2N vs K
-        assert_eq!(scale_factor(&pos2), 0);
-        assert!(evaluate(&pos2).abs() < 50);
-    }
-
-    #[test]
-    fn rook_one_side_scaling() {
-        let pos = parse_fen("4k3/8/8/8/8/8/PP6/R3K2R w K - 0 1").unwrap(); // Rooks + pawns all on queenside
-        assert_eq!(scale_factor(&pos), 36);
-        // Mixed pawns not one side -> 64 (a-file + e-file)
-        let pos_mixed = parse_fen("4k3/8/8/8/8/8/P3P3/R3K2R w K - 0 1").unwrap(); // a2 and e2
-        assert_eq!(scale_factor(&pos_mixed), 64);
     }
 }
