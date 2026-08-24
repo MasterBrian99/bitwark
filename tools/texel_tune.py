@@ -157,7 +157,8 @@ def sigmoid(x: float) -> float:
     # logistic with 400 scale to match eval scale
     return 1.0 / (1.0 + math.exp(-x / 400.0))
 
-def parse_dataset(path: Path, max_positions: int | None) -> list[tuple[str, int]]:
+def parse_dataset(path: Path, max_positions: int | None) -> list[tuple[str, int, int]]:
+    """Parse fen|cp or fen|cp|offset lines. Returns (fen, cp, offset)."""
     out = []
     with open(path) as f:
         for line in f:
@@ -166,12 +167,22 @@ def parse_dataset(path: Path, max_positions: int | None) -> list[tuple[str, int]
                 continue
             if "|" not in line:
                 continue
-            fen, cp_s = line.rsplit("|", 1)
-            try:
-                cp = int(cp_s.strip())
-            except Exception:
-                continue
-            out.append((fen.strip(), cp))
+            # handle fen|cp|offset or fen|cp
+            parts = line.rsplit("|", 2)
+            if len(parts) == 3:
+                fen, cp_s, off_s = parts
+                try:
+                    cp = int(cp_s.strip()); off = int(off_s.strip())
+                except Exception:
+                    continue
+            else:
+                fen, cp_s = line.rsplit("|", 1)
+                try:
+                    cp = int(cp_s.strip())
+                except Exception:
+                    continue
+                off = 0
+            out.append((fen.strip(), cp, off))
             if max_positions and len(out) >= max_positions:
                 break
     return out
@@ -222,15 +233,17 @@ def main():
         print(f"no data in {args.data}", file=sys.stderr)
         sys.exit(2)
     print(f"Loaded {len(data)} positions")
+    # shuffle before held-out split for unbiased validation
+    random.shuffle(data)
 
     # Build per-position structures
     positions = []
-    for fen, sf_cp in data:
+    for fen, sf_cp, offset in data:
         board = chess.Board(fen)
         phase, mg_feats, eg_feats = board_features(board)
         # sf sigmoid
         sf_s = sigmoid(sf_cp)
-        positions.append((fen, sf_cp, sf_s, phase, mg_feats, eg_feats))
+        positions.append((fen, sf_cp, sf_s, phase, mg_feats, eg_feats, offset))
 
     # Current params
     mg_params = MG_VALUE.copy() + [v for tbl in MG_TABLES for v in tbl]
@@ -249,32 +262,43 @@ def main():
     # Precompute per-position mg/eg and cp, and error
     # Also build inverted index for quick updates
     n = len(positions)
+    # held-out split 10% for validation
+    val_size = max(1, n // 10)
+    val_indices = set(random.sample(range(n), val_size))
+    train_indices = [i for i in range(n) if i not in val_indices]
+    print(f"Held-out: {val_size} val, {len(train_indices)} train")
+
     cur_mg = [0.0] * n
     cur_eg = [0.0] * n
     cur_cp = [0.0] * n
-    for i, (fen, sf_cp, sf_s, phase, mg_feats, eg_feats) in enumerate(positions):
+    for i, (fen, sf_cp, sf_s, phase, mg_feats, eg_feats, offset) in enumerate(positions):
         mg = sum(mg_params[idx] * coeff for idx, coeff in mg_feats.items())
         eg = sum(eg_params[idx] * coeff for idx, coeff in eg_feats.items())
         cur_mg[i] = mg
         cur_eg[i] = eg
-        # tempo ignored for tuning (small)
-        cp = (mg * phase + eg * (24 - phase)) / 24
+        # tempo ignored for tuning (small); offset is other-terms interpolated value
+        cp = (mg * phase + eg * (24 - phase)) / 24 + offset
         cur_cp[i] = cp
 
-    def total_error():
+    def total_error(indices=None):
+        if indices is None:
+            indices = range(n)
+            denom = n
+        else:
+            denom = len(indices)
         s = 0.0
-        for i in range(n):
+        for i in indices:
             sf_s = positions[i][2]
             our_s = sigmoid(cur_cp[i])
             d = our_s - sf_s
             s += d * d
-        return s / n
+        return s / denom if denom else 0.0
 
     # Build inverted index: for each mg param, list of (pos_idx, coeff*phase_factor)
     # For mg, factor = phase/24 ; for eg, factor = (24-phase)/24
     mg_inv: list[list[tuple[int, float]]] = [[] for _ in range(390)]
     eg_inv: list[list[tuple[int, float]]] = [[] for _ in range(390)]
-    for i, (fen, sf_cp, sf_s, phase, mg_feats, eg_feats) in enumerate(positions):
+    for i, (fen, sf_cp, sf_s, phase, mg_feats, eg_feats, offset) in enumerate(positions):
         fmg = phase / 24.0
         feg = (24 - phase) / 24.0
         for idx, coeff in mg_feats.items():
@@ -284,44 +308,36 @@ def main():
             eg_inv[idx].append((i, coeff * feg))
 
     init_err = total_error()
-    print(f"Initial MSE: {init_err:.6f}")
+    init_train = total_error(train_indices)
+    init_val = total_error(list(val_indices))
+    print(f"Initial MSE: {init_err:.6f} (train {init_train:.6f} val {init_val:.6f})")
 
-    # Coordinate descent
+    # Coordinate descent (train error drives decisions; val logged)
     step = args.step
     for epoch in range(args.epochs):
         improved = 0
         # Tune MG
         for param_idx in range(390):
-            # Skip King material (5) which is always 0? Keep but allow to move — but phase weight 0, but pst still matters.
-            # Fix King material to 0? Keep it fixed at 0 to avoid drift.
-            if param_idx == 5:  # King MG material
+            if param_idx == 5:  # King MG material pinned
                 continue
-            if param_idx == 390 - 384 + 5*64:  # not needed
-                pass
-            old_val = mg_params[param_idx]
-            # Current error already computed
-            cur_err = total_error()
-            # Try +step
-            # Apply incrementally to cur_cp for affected positions
             inv = mg_inv[param_idx]
             if not inv:
                 continue
+            cur_err = total_error(train_indices)
             # Try +step
             for pos_idx, coeff in inv:
                 cur_cp[pos_idx] += step * coeff
-            err_plus = total_error()
-            # Revert
+            err_plus = total_error(train_indices)
             for pos_idx, coeff in inv:
                 cur_cp[pos_idx] -= step * coeff
             # Try -step
             for pos_idx, coeff in inv:
                 cur_cp[pos_idx] -= step * coeff
-            err_minus = total_error()
+            err_minus = total_error(train_indices)
             for pos_idx, coeff in inv:
                 cur_cp[pos_idx] += step * coeff
 
             if err_plus < cur_err - 1e-9 and err_plus <= err_minus:
-                # accept +step
                 mg_params[param_idx] += step
                 for pos_idx, coeff in inv:
                     cur_cp[pos_idx] += step * coeff
@@ -331,47 +347,47 @@ def main():
                 for pos_idx, coeff in inv:
                     cur_cp[pos_idx] -= step * coeff
                 improved += 1
-            # else keep
         # Tune EG
         for param_idx in range(390):
             if param_idx == 5:
                 continue
-            old_val = eg_params[param_idx]
             inv = eg_inv[param_idx]
             if not inv:
                 continue
+            cur_err = total_error(train_indices)
             for pos_idx, coeff in inv:
                 cur_cp[pos_idx] += step * coeff
-            err_plus = total_error()
+            err_plus = total_error(train_indices)
             for pos_idx, coeff in inv:
                 cur_cp[pos_idx] -= step * coeff
             for pos_idx, coeff in inv:
                 cur_cp[pos_idx] -= step * coeff
-            err_minus = total_error()
+            err_minus = total_error(train_indices)
             for pos_idx, coeff in inv:
                 cur_cp[pos_idx] += step * coeff
-            if err_plus < total_error() - 1e-9 and err_plus <= err_minus:
+            if err_plus < cur_err - 1e-9 and err_plus <= err_minus:
                 eg_params[param_idx] += step
                 for pos_idx, coeff in inv:
                     cur_cp[pos_idx] += step * coeff
                 improved += 1
-            elif err_minus < total_error() - 1e-9:
+            elif err_minus < cur_err - 1e-9:
                 eg_params[param_idx] -= step
                 for pos_idx, coeff in inv:
                     cur_cp[pos_idx] -= step * coeff
                 improved += 1
-        cur_err = total_error()
-        print(f"Epoch {epoch+1}/{args.epochs} step {step} improved {improved} params, MSE {cur_err:.6f}")
+        train_err = total_error(train_indices)
+        val_err = total_error(list(val_indices))
+        print(f"Epoch {epoch+1}/{args.epochs} step {step} improved {improved} params, MSE train {train_err:.6f} val {val_err:.6f}")
         if improved == 0:
             step = max(1, step // 2)
             print(f"  no improvement, halving step to {step}")
             if step == 1 and improved == 0:
-                # one more epoch at 1
                 pass
-        # Optional early stop if step 1 and no improved
-
+    final_train = total_error(train_indices)
+    final_val = total_error(list(val_indices))
     final_err = total_error()
-    print(f"Final MSE {final_err:.6f} (init {init_err:.6f}, delta {init_err-final_err:+.6f})")
+    print(f"Final MSE {final_err:.6f} (train {final_train:.6f} val {final_val:.6f}) init {init_err:.6f} delta {init_err-final_err:+.6f}")
+    print(f"Train {init_train:.6f}->{final_train:.6f} Val {init_val:.6f}->{final_val:.6f}")
 
     # Write Rust tables
     out = Path(args.out)

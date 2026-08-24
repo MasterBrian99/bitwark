@@ -78,6 +78,22 @@ async def play_game(opening: list[str], play_depth: int, sem: asyncio.Semaphore)
         async with UciEngine(STOCKFISH_BIN) as eng:
             await eng.handshake()
             board = chess.Board()
+            # 8 random plies to break determinism (fixed openings at fixed depth are deterministic)
+            for _ in range(8):
+                if board.is_game_over():
+                    break
+                moves = list(board.legal_moves)
+                random.shuffle(moves)
+                chosen = None
+                for mv in moves:
+                    board.push(mv)
+                    if not board.is_check():
+                        chosen = mv
+                        break
+                    board.pop()
+                if chosen is None:
+                    # all moves give check, just push a random one
+                    board.push(random.choice(list(board.legal_moves)))
             for mv in opening:
                 try:
                     board.push_uci(mv)
@@ -85,7 +101,7 @@ async def play_game(opening: list[str], play_depth: int, sem: asyncio.Semaphore)
                     break
             fens: list[str] = []
             max_ply = 120
-            ply = len(opening)
+            ply = board.ply()
             while ply < max_ply and not board.is_game_over():
                 # Record every 4 plies after move 8, skip checks
                 if ply >= 8 and ply % 4 == 0 and not board.is_check():
