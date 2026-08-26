@@ -178,6 +178,43 @@
         "kiwipete_d4": 4085603,
         "ok": true
       }
+    },
+    {
+      "phase": "phase3",
+      "date": "2026-08-26T10:09:16.333848+00:00",
+      "cpu": "12th Gen Intel(R) Core(TM) i5-12450HX",
+      "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
+      "git_tag": "phase3-baseline",
+      "bench": {
+        "tt": 16,
+        "threads": 1,
+        "depth": 13,
+        "suite": "default",
+        "nodes": 21205791,
+        "nps_median": 1942277,
+        "runs": [
+          {
+            "nodes": 21205791,
+            "nps": 1926398,
+            "time_ms": 11008
+          },
+          {
+            "nodes": 21205791,
+            "nps": 1942277,
+            "time_ms": 10918
+          },
+          {
+            "nodes": 21205791,
+            "nps": 1975020,
+            "time_ms": 10737
+          }
+        ]
+      },
+      "perft": {
+        "startpos_d5": 4865609,
+        "kiwipete_d4": 4085603,
+        "ok": true
+      }
     }
   ]
 }

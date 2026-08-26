@@ -207,6 +207,8 @@ pub struct SearchContext<'a> {
     /// Per-ply quiets tried at this node (for history malus, 1.4).
     /// Only `0..quiets_cnt[ply]` is valid; stale entries are never read.
     pub quiets_stack: Box<[[Option<Move>; 218]; MAX_PLY]>,
+    /// Consecutive singular extensions along current line (SE cap, 3.2/3.3).
+    pub se_extensions: [u8; MAX_PLY],
 }
 
 impl<'a> SearchContext<'a> {
@@ -251,6 +253,7 @@ impl<'a> SearchContext<'a> {
             is_main,
             check_count: 1,
             quiets_stack: Box::new([[None; 218]; MAX_PLY]),
+            se_extensions: [0; MAX_PLY],
         }
     }
 
@@ -394,6 +397,8 @@ pub(crate) fn search_single(
         if stop.load(Ordering::Relaxed) {
             break;
         }
+        // Clear SE extension stack each iteration (otherwise stale counts leak across ID depths)
+        ctx.se_extensions = [0; MAX_PLY];
         if ctx.tc.should_hard_stop() {
             stop.store(true, Ordering::Relaxed);
             break;
@@ -481,6 +486,7 @@ pub(crate) fn search_single(
                     VALUE_INFINITE,
                     1,
                     true,
+                    None,
                     &mut ctx,
                 );
                 pos.unmake_move(mv);
@@ -864,13 +870,13 @@ fn root_search(
         }
         pos.make_move(mv);
         let score = if i == 0 {
-            -alpha_beta::negamax(pos, depth - 1, -beta, -alpha, 1, true, ctx)
+            -alpha_beta::negamax(pos, depth - 1, -beta, -alpha, 1, true, None, ctx)
         } else {
             // PVS zero-window
-            let v = -alpha_beta::negamax(pos, depth - 1, -alpha - 1, -alpha, 1, true, ctx);
+            let v = -alpha_beta::negamax(pos, depth - 1, -alpha - 1, -alpha, 1, true, None, ctx);
             if v > alpha && v < beta {
                 // Re-search with full window (PV node)
-                -alpha_beta::negamax(pos, depth - 1, -beta, -alpha, 1, true, ctx)
+                -alpha_beta::negamax(pos, depth - 1, -beta, -alpha, 1, true, None, ctx)
             } else {
                 v
             }
@@ -954,6 +960,18 @@ mod tests {
         let res = search_depth(fen, 3);
         assert!(
             res.score > MATE - 10,
+            "expected mate score, got {}",
+            res.score
+        );
+    }
+
+    #[test]
+    fn mate_in_5_found() {
+        // Q2K4/8/3k4/8/8/8/8/8 w - - 0 1 is mate in 5 (Stockfish). Exercises singular extensions.
+        let fen = "Q2K4/8/3k4/8/8/8/8/8 w - - 0 1";
+        let res = search_depth(fen, 10);
+        assert!(
+            res.score > MATE - 20,
             "expected mate score, got {}",
             res.score
         );
