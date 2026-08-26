@@ -61,6 +61,8 @@ pub struct ZobristKeys {
     pub castling: [u64; 16],
     /// `en_passant[file]` (0..8, only file matters per Stockfish).
     pub en_passant: [u64; 8],
+    /// `mat_count[piece][count]` — 12 × 16, for material hash (count-keyed).
+    pub mat_count: [[u64; 16]; 12],
 }
 
 impl ZobristKeys {
@@ -103,11 +105,24 @@ impl ZobristKeys {
             *slot = v;
         }
 
+        let mut mat_count = [[0u64; 16]; 12];
+        for p in 0..12 {
+            mat_count[p][0] = 0;
+            for c in 1..16 {
+                let mut v = rng.next();
+                if v == 0 {
+                    v = 1;
+                }
+                mat_count[p][c] = v;
+            }
+        }
+
         Self {
             piece_sq,
             side,
             castling,
             en_passant,
+            mat_count,
         }
     }
 

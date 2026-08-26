@@ -85,6 +85,7 @@ struct UndoInfo {
     psqt_mg: i32,
     psqt_eg: i32,
     pawn_hash: u64,
+    material_hash: u64,
 }
 
 /// A chess position. `Clone` so search can copy-make into its own position.
@@ -115,6 +116,8 @@ pub struct Position {
     psqt_eg: i32,
     /// Pawn structure hash (XOR of pawn piece-square keys only).
     pawn_hash: u64,
+    /// Material hash (XOR of mat_count keys, count-keyed per piece type).
+    material_hash: u64,
     /// History stack for unmake.
     history: Vec<UndoInfo>,
 }
@@ -136,6 +139,7 @@ impl Position {
             psqt_mg: 0,
             psqt_eg: 0,
             pawn_hash: 0,
+            material_hash: 0,
             history: Vec::with_capacity(384),
         }
     }
@@ -158,8 +162,14 @@ impl Position {
         let old = self.board[idx];
         // Remove old piece if any.
         if let Some(old_p) = old {
+            let p_idx = old_p.index();
+            let cnt_before = self.pieces[p_idx].count() as usize;
+            let cnt_after = cnt_before - 1;
+            self.material_hash ^=
+                crate::board::zobrist::keys().mat_count[p_idx][cnt_before]
+                    ^ crate::board::zobrist::keys().mat_count[p_idx][cnt_after];
             let bb = Bitboard::from_sq(sq);
-            self.pieces[old_p.index()] = Bitboard(self.pieces[old_p.index()].0 & !bb.0);
+            self.pieces[p_idx] = Bitboard(self.pieces[p_idx].0 & !bb.0);
             self.occupancy[old_p.color().as_usize()] =
                 Bitboard(self.occupancy[old_p.color().as_usize()].0 & !bb.0);
             self.occupied = Bitboard(self.occupied.0 & !bb.0);
@@ -172,8 +182,14 @@ impl Position {
         }
         // Place new piece if any.
         if let Some(p) = piece {
+            let p_idx = p.index();
+            let cnt_before = self.pieces[p_idx].count() as usize;
+            let cnt_after = cnt_before + 1;
+            self.material_hash ^=
+                crate::board::zobrist::keys().mat_count[p_idx][cnt_before]
+                    ^ crate::board::zobrist::keys().mat_count[p_idx][cnt_after];
             let bb = Bitboard::from_sq(sq);
-            self.pieces[p.index()] = Bitboard(self.pieces[p.index()].0 | bb.0);
+            self.pieces[p_idx] = Bitboard(self.pieces[p_idx].0 | bb.0);
             self.occupancy[p.color().as_usize()] =
                 Bitboard(self.occupancy[p.color().as_usize()].0 | bb.0);
             self.occupied = Bitboard(self.occupied.0 | bb.0);
@@ -253,6 +269,11 @@ impl Position {
     }
 
     #[inline]
+    pub fn material_hash(&self) -> u64 {
+        self.material_hash
+    }
+
+    #[inline]
     pub fn occupied(&self) -> Bitboard {
         self.occupied
     }
@@ -318,6 +339,7 @@ impl Position {
             psqt_mg: self.psqt_mg,
             psqt_eg: self.psqt_eg,
             pawn_hash: self.pawn_hash,
+            material_hash: self.material_hash,
         };
         let old_hash = undo.hash;
         let old_en_passant = undo.en_passant;
@@ -539,6 +561,7 @@ impl Position {
         self.psqt_mg = undo.psqt_mg;
         self.psqt_eg = undo.psqt_eg;
         self.pawn_hash = undo.pawn_hash;
+        self.material_hash = undo.material_hash;
     }
 
     // -----------------------------------------------------------------------
@@ -655,6 +678,7 @@ impl Position {
             psqt_mg: self.psqt_mg,
             psqt_eg: self.psqt_eg,
             pawn_hash: self.pawn_hash,
+            material_hash: self.material_hash,
         };
         let old_hash = self.hash;
         let old_ep = self.en_passant;
@@ -692,6 +716,7 @@ impl Position {
         self.psqt_mg = undo.psqt_mg;
         self.psqt_eg = undo.psqt_eg;
         self.pawn_hash = undo.pawn_hash;
+        self.material_hash = undo.material_hash;
     }
 
     /// Flip side to move without touching history (debug `flip` command, UCI spec §5.7).
