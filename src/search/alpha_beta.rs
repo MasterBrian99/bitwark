@@ -27,6 +27,7 @@ use super::{MATE, MAX_PLY, SearchContext, quiescence::quiescence, tt::Bound};
 
 const SE_MIN_DEPTH: i32 = 8;
 const SE_TT_DEPTH_SLACK: i32 = 3;
+#[allow(dead_code)]
 const SE_VERIF_RED: i32 = 3;
 const SE_MARGIN_PER_DEPTH: i32 = 4;
 const SE_EXT_CAP: u8 = 6;

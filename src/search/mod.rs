@@ -966,6 +966,18 @@ mod tests {
     }
 
     #[test]
+    fn mate_in_5_found() {
+        // Q2K4/8/3k4/8/8/8/8/8 w - - 0 1 is mate in 5 (Stockfish). Exercises singular extensions.
+        let fen = "Q2K4/8/3k4/8/8/8/8/8 w - - 0 1";
+        let res = search_depth(fen, 10);
+        assert!(
+            res.score > MATE - 20,
+            "expected mate score, got {}",
+            res.score
+        );
+    }
+
+    #[test]
     fn repetition_draw() {
         let fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
         let mut pos = parse_fen(fen).unwrap();
