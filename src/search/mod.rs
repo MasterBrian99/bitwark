@@ -776,7 +776,7 @@ fn root_search(
             let best_idx = {
                 let slice = &moves[i..];
                 let mut best = 0;
-                let mut best_s = order::score_move(
+                let mut best_s = order::score_move_with_see(
                     pos,
                     slice[0],
                     None,
@@ -790,7 +790,7 @@ fn root_search(
                     0,
                 );
                 for (j, &mv) in slice.iter().enumerate().skip(1) {
-                    let s = order::score_move(
+                    let s = order::score_move_with_see(
                         pos,
                         mv,
                         None,
