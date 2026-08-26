@@ -264,6 +264,7 @@ pub fn negamax(
         && tt_move.is_some()
         && depth >= SE_MIN_DEPTH
         && !ctx.stop.load(Ordering::Relaxed)
+        && ply != 0
         && ply < MAX_PLY - 1
     {
         if let Some(hit) = tt_hit_for_se {
