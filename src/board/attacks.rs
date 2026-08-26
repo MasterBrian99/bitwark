@@ -525,7 +525,14 @@ pub fn bishop_attacks(sq: Square, occupied: Bitboard) -> Bitboard {
     let t = magic_tables();
     let m = t.bishop_magics[sq.index() as usize];
     let blockers = occupied & m.mask;
-    #[cfg(target_arch = "x86_64")]
+    // Compile-time dispatch when BMI2 is a target feature (target-cpu=native on
+    // this machine) — zero runtime cost. Otherwise fall back to runtime probe.
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    {
+        let idx = unsafe { pext_u64(blockers.0, m.mask.0) as usize };
+        return t.bishop_pext_table[m.offset + idx];
+    }
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "bmi2")))]
     if has_bmi2() {
         // SAFETY: has_bmi2() guarantees BMI2 support.
         let idx = unsafe { pext_u64(blockers.0, m.mask.0) as usize };
@@ -541,7 +548,12 @@ pub fn rook_attacks(sq: Square, occupied: Bitboard) -> Bitboard {
     let t = magic_tables();
     let m = t.rook_magics[sq.index() as usize];
     let blockers = occupied & m.mask;
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    {
+        let idx = unsafe { pext_u64(blockers.0, m.mask.0) as usize };
+        return t.rook_pext_table[m.offset + idx];
+    }
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "bmi2")))]
     if has_bmi2() {
         let idx = unsafe { pext_u64(blockers.0, m.mask.0) as usize };
         return t.rook_pext_table[m.offset + idx];
