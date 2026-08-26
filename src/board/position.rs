@@ -136,7 +136,7 @@ impl Position {
             psqt_mg: 0,
             psqt_eg: 0,
             pawn_hash: 0,
-            history: Vec::new(),
+            history: Vec::with_capacity(384),
         }
     }
 

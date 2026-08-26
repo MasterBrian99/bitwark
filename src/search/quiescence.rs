@@ -29,7 +29,7 @@ pub fn quiescence(
     if ctx.stop.load(Ordering::Relaxed) {
         return 0;
     }
-    if ctx.nodes.is_multiple_of(2048) {
+    if ctx.tick_check() {
         ctx.flush_nodes();
         if ctx.tc.should_hard_stop() {
             ctx.stop.store(true, Ordering::Relaxed);
@@ -60,7 +60,8 @@ pub fn quiescence(
     // TT probe — qsearch entries are stored at depth 0, any hit with
     // sufficient depth can cut off. Mirrors alpha_beta's probe logic.
     let orig_alpha = alpha;
-    if let Some(hit) = ctx.tt.probe(pos.hash(), ply) {
+    let tt_hit = ctx.tt.probe(pos.hash(), ply);
+    if let Some(hit) = tt_hit {
         match hit.bound {
             Bound::Exact => return hit.score,
             Bound::Lower if hit.score >= beta => return hit.score,
@@ -89,8 +90,8 @@ pub fn quiescence(
     }
 
     // Score captures — now SEE-aware via order.rs (winning captures above killers)
-    // Pass TT move to order first if we hit.
-    let tt_move = ctx.tt.probe(pos.hash(), ply).and_then(|h| h.mv);
+    // Reuse the earlier TT hit (single probe).
+    let tt_move = tt_hit.and_then(|h| h.mv);
     let dummy_killers = [None, None];
     let dummy_history = [[[0; 64]; 64]; 2];
     crate::search::order::score_list(

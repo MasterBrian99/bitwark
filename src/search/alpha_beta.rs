@@ -166,7 +166,7 @@ pub fn negamax(
     if ctx.stop.load(Ordering::Relaxed) {
         return 0;
     }
-    if ctx.nodes.is_multiple_of(2048) {
+    if ctx.tick_check() {
         ctx.flush_nodes();
         if ctx.tc.should_hard_stop() {
             ctx.stop.store(true, Ordering::Relaxed);
@@ -319,8 +319,8 @@ pub fn negamax(
     let mut best_score = -MATE * 2;
     let original_alpha = alpha;
     let mut best_move: Option<Move> = None;
-    // Tracker for history malus (10c): quiets actually searched at this node
-    let mut quiets_tried: [Option<Move>; 218] = [None; 218];
+    // Tracker for history malus (10c): quiets actually searched at this node.
+    // Stored per-ply in SearchContext (1.4) to avoid a ~1.3KB zeroed stack frame.
     let mut quiets_cnt: usize = 0;
 
     let list_len = list.len;
@@ -346,7 +346,8 @@ pub fn negamax(
             }
         }
         if quiet {
-            quiets_tried[quiets_cnt] = Some(mv);
+            // Safety: ply < MAX_PLY guaranteed by early return above
+            ctx.quiets_stack[ply][quiets_cnt] = Some(mv);
             quiets_cnt += 1;
         }
 
@@ -485,7 +486,7 @@ pub fn negamax(
                     }
                     // Malus for quiets searched before the cutoff (10c)
                     for j in 0..quiets_cnt {
-                        if let Some(qm) = quiets_tried[j] {
+                        if let Some(qm) = ctx.quiets_stack[ply][j] {
                             if qm == mv {
                                 continue;
                             }
