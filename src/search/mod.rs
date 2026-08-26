@@ -53,6 +53,8 @@ pub const MATE: i32 = 30_000;
 pub const VALUE_INFINITE: i32 = 32_000;
 /// Maximum search depth (plies) including quiescence.
 pub const MAX_PLY: usize = 128;
+/// Node interval for stop/time/node-limit checks (countdown in SearchContext).
+pub const NODE_CHECK_INTERVAL: u32 = 2048;
 
 // ---------------------------------------------------------------------------
 // Limits
@@ -200,6 +202,11 @@ pub struct SearchContext<'a> {
     pub thread_id: usize,
     /// Whether this worker should emit `SearchEvent`s.
     pub is_main: bool,
+    /// Countdown to next stop/time check (2048-node cadence, see `tick_check`).
+    pub check_count: u32,
+    /// Per-ply quiets tried at this node (for history malus, 1.4).
+    /// Only `0..quiets_cnt[ply]` is valid; stale entries are never read.
+    pub quiets_stack: Box<[[Option<Move>; 218]; MAX_PLY]>,
 }
 
 impl<'a> SearchContext<'a> {
@@ -242,6 +249,21 @@ impl<'a> SearchContext<'a> {
             last_flush: 0,
             thread_id,
             is_main,
+            check_count: 1,
+            quiets_stack: Box::new([[None; 218]; MAX_PLY]),
+        }
+    }
+
+    /// Countdown tick for stop/time checks. Returns true every `NODE_CHECK_INTERVAL` calls.
+    /// Initialized to 1 so the first call fires (matches `nodes == 0` case).
+    #[inline]
+    pub fn tick_check(&mut self) -> bool {
+        self.check_count = self.check_count.wrapping_sub(1);
+        if self.check_count == 0 {
+            self.check_count = NODE_CHECK_INTERVAL;
+            true
+        } else {
+            false
         }
     }
 
@@ -814,7 +836,7 @@ fn root_search(
             return None;
         }
         // Periodic flush + checks at root per-move (also handled inside negamax).
-        if ctx.nodes.is_multiple_of(2048) {
+        if ctx.tick_check() {
             ctx.flush_nodes();
             if ctx.tc.should_hard_stop() {
                 ctx.stop.store(true, Ordering::Relaxed);

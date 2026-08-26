@@ -122,6 +122,11 @@ pub const F1: Square = Square(5);
 pub const G1: Square = Square(6);
 pub const H1: Square = Square(7);
 pub const A8: Square = Square(56);
+pub const C8: Square = Square(58);
+pub const D8: Square = Square(59);
+pub const E8: Square = Square(60);
+pub const F8: Square = Square(61);
+pub const G8: Square = Square(62);
 pub const H8: Square = Square(63);
 pub const E4: Square = Square(28);
 

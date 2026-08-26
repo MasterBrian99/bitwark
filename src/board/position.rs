@@ -25,6 +25,20 @@ pub const CASTLE_BK: u8 = 4; // k
 pub const CASTLE_BQ: u8 = 8; // q
 pub const CASTLE_ALL: u8 = CASTLE_WK | CASTLE_WQ | CASTLE_BK | CASTLE_BQ;
 
+/// Castling rook squares for a king move `from -> to`.
+/// Returns `(rook_from, rook_to)` for the four legal castling moves, else `None`.
+#[inline]
+fn castling_rook_squares(from: Square, to: Square) -> Option<(Square, Square)> {
+    use crate::board::types::{A1, A8, C1, C8, D1, D8, E1, E8, F1, F8, G1, G8, H1, H8};
+    match (from, to) {
+        (E1, G1) => Some((H1, F1)),
+        (E1, C1) => Some((A1, D1)),
+        (E8, G8) => Some((H8, F8)),
+        (E8, C8) => Some((A8, D8)),
+        _ => None,
+    }
+}
+
 #[inline]
 fn psqt_delta(p: Piece, sq: Square) -> (i32, i32) {
     let idx = sq.index() as usize;
@@ -122,7 +136,7 @@ impl Position {
             psqt_mg: 0,
             psqt_eg: 0,
             pawn_hash: 0,
-            history: Vec::new(),
+            history: Vec::with_capacity(384),
         }
     }
 
@@ -352,43 +366,8 @@ impl Position {
 
         // Handle castling rook move
         if is_castling {
-            let (rook_from, rook_to) = match (from, to) {
-                // White
-                f if f.0 == Square::from_str("e1").unwrap()
-                    && f.1 == Square::from_str("g1").unwrap() =>
-                {
-                    (
-                        Square::from_str("h1").unwrap(),
-                        Square::from_str("f1").unwrap(),
-                    )
-                }
-                f if f.0 == Square::from_str("e1").unwrap()
-                    && f.1 == Square::from_str("c1").unwrap() =>
-                {
-                    (
-                        Square::from_str("a1").unwrap(),
-                        Square::from_str("d1").unwrap(),
-                    )
-                }
-                // Black
-                f if f.0 == Square::from_str("e8").unwrap()
-                    && f.1 == Square::from_str("g8").unwrap() =>
-                {
-                    (
-                        Square::from_str("h8").unwrap(),
-                        Square::from_str("f8").unwrap(),
-                    )
-                }
-                f if f.0 == Square::from_str("e8").unwrap()
-                    && f.1 == Square::from_str("c8").unwrap() =>
-                {
-                    (
-                        Square::from_str("a8").unwrap(),
-                        Square::from_str("d8").unwrap(),
-                    )
-                }
-                _ => panic!("invalid castling move {mv}"),
-            };
+            let (rook_from, rook_to) = castling_rook_squares(from, to)
+                .unwrap_or_else(|| panic!("invalid castling move {mv}"));
             let rook = self.piece_at(rook_from).expect("castling rook missing");
             self.set_piece(rook_from, None);
             self.set_piece(rook_to, Some(rook));
@@ -400,16 +379,16 @@ impl Position {
             Piece::WK => self.castling &= !(CASTLE_WK | CASTLE_WQ),
             Piece::BK => self.castling &= !(CASTLE_BK | CASTLE_BQ),
             Piece::WR => {
-                if from == Square::from_str("h1").unwrap() {
+                if from == crate::board::types::H1 {
                     self.castling &= !CASTLE_WK;
-                } else if from == Square::from_str("a1").unwrap() {
+                } else if from == crate::board::types::A1 {
                     self.castling &= !CASTLE_WQ;
                 }
             }
             Piece::BR => {
-                if from == Square::from_str("h8").unwrap() {
+                if from == crate::board::types::H8 {
                     self.castling &= !CASTLE_BK;
-                } else if from == Square::from_str("a8").unwrap() {
+                } else if from == crate::board::types::A8 {
                     self.castling &= !CASTLE_BQ;
                 }
             }
@@ -419,16 +398,16 @@ impl Position {
         if let Some(cap) = captured {
             match cap {
                 Piece::WR => {
-                    if to == Square::from_str("h1").unwrap() {
+                    if to == crate::board::types::H1 {
                         self.castling &= !CASTLE_WK;
-                    } else if to == Square::from_str("a1").unwrap() {
+                    } else if to == crate::board::types::A1 {
                         self.castling &= !CASTLE_WQ;
                     }
                 }
                 Piece::BR => {
-                    if to == Square::from_str("h8").unwrap() {
+                    if to == crate::board::types::H8 {
                         self.castling &= !CASTLE_BK;
-                    } else if to == Square::from_str("a8").unwrap() {
+                    } else if to == crate::board::types::A8 {
                         self.castling &= !CASTLE_BQ;
                     }
                 }
@@ -490,41 +469,8 @@ impl Position {
         new_hash ^= keys.piece_sq[placed_for_hash.index()][to.index() as usize];
         // Castling rook
         if is_castling {
-            let (rook_from, rook_to) = match (from, to) {
-                f if f.0 == Square::from_str("e1").unwrap()
-                    && f.1 == Square::from_str("g1").unwrap() =>
-                {
-                    (
-                        Square::from_str("h1").unwrap(),
-                        Square::from_str("f1").unwrap(),
-                    )
-                }
-                f if f.0 == Square::from_str("e1").unwrap()
-                    && f.1 == Square::from_str("c1").unwrap() =>
-                {
-                    (
-                        Square::from_str("a1").unwrap(),
-                        Square::from_str("d1").unwrap(),
-                    )
-                }
-                f if f.0 == Square::from_str("e8").unwrap()
-                    && f.1 == Square::from_str("g8").unwrap() =>
-                {
-                    (
-                        Square::from_str("h8").unwrap(),
-                        Square::from_str("f8").unwrap(),
-                    )
-                }
-                f if f.0 == Square::from_str("e8").unwrap()
-                    && f.1 == Square::from_str("c8").unwrap() =>
-                {
-                    (
-                        Square::from_str("a8").unwrap(),
-                        Square::from_str("d8").unwrap(),
-                    )
-                }
-                _ => panic!("invalid castling move {mv}"),
-            };
+            let (rook_from, rook_to) = castling_rook_squares(from, to)
+                .unwrap_or_else(|| panic!("invalid castling move {mv}"));
             let rook = if moving.color() == Color::White {
                 Piece::WR
             } else {
@@ -559,41 +505,8 @@ impl Position {
             && (from.file() as i8 - to.file() as i8).abs() == 2;
 
         if is_castling {
-            let (rook_from, rook_to) = match (from, to) {
-                f if f.0 == Square::from_str("e1").unwrap()
-                    && f.1 == Square::from_str("g1").unwrap() =>
-                {
-                    (
-                        Square::from_str("h1").unwrap(),
-                        Square::from_str("f1").unwrap(),
-                    )
-                }
-                f if f.0 == Square::from_str("e1").unwrap()
-                    && f.1 == Square::from_str("c1").unwrap() =>
-                {
-                    (
-                        Square::from_str("a1").unwrap(),
-                        Square::from_str("d1").unwrap(),
-                    )
-                }
-                f if f.0 == Square::from_str("e8").unwrap()
-                    && f.1 == Square::from_str("g8").unwrap() =>
-                {
-                    (
-                        Square::from_str("h8").unwrap(),
-                        Square::from_str("f8").unwrap(),
-                    )
-                }
-                f if f.0 == Square::from_str("e8").unwrap()
-                    && f.1 == Square::from_str("c8").unwrap() =>
-                {
-                    (
-                        Square::from_str("a8").unwrap(),
-                        Square::from_str("d8").unwrap(),
-                    )
-                }
-                _ => panic!("invalid castling unmake {mv}"),
-            };
+            let (rook_from, rook_to) = castling_rook_squares(from, to)
+                .unwrap_or_else(|| panic!("invalid castling unmake {mv}"));
             if let Some(rook) = self.piece_at(rook_to) {
                 self.set_piece(rook_to, None);
                 self.set_piece(rook_from, Some(rook));
