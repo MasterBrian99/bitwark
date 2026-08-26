@@ -209,6 +209,12 @@ pub struct SearchContext<'a> {
     pub quiets_stack: Box<[[Option<Move>; 218]; MAX_PLY]>,
     /// Consecutive singular extensions along current line (SE cap, 3.2/3.3).
     pub se_extensions: [u8; MAX_PLY],
+    /// Pawn correction history — mg/eg pair per (pawn_hash bucket, side to move).
+    /// Bucket = pawn_hash & 16383, side = stm, [mg, eg]. Applied as
+    /// `((mg*phase + eg*(24-phase))/24)/256`. 256 KiB per thread (4.2).
+    pub pawn_corr: Box<[[[i32; 2]; 2]; 16384]>,
+    /// Material correction history — same shape, keyed on material_hash (4.3).
+    pub mat_corr: Box<[[[i32; 2]; 2]; 16384]>,
 }
 
 impl<'a> SearchContext<'a> {
@@ -254,6 +260,8 @@ impl<'a> SearchContext<'a> {
             check_count: 1,
             quiets_stack: Box::new([[None; 218]; MAX_PLY]),
             se_extensions: [0; MAX_PLY],
+            pawn_corr: Box::new([[[0; 2]; 2]; 16384]),
+            mat_corr: Box::new([[[0; 2]; 2]; 16384]),
         }
     }
 
@@ -287,6 +295,58 @@ impl<'a> SearchContext<'a> {
         self.total_nodes
             .load(Ordering::Relaxed)
             .wrapping_add(unflushed)
+    }
+}
+
+impl<'a> SearchContext<'a> {
+    #[inline]
+    fn corr_gravity(entry: &mut i32, bonus: i32) {
+        *entry += bonus - *entry * bonus / 16384;
+        *entry = (*entry).clamp(-16384, 16384);
+    }
+
+    #[inline]
+    pub fn pawn_correction(&self, pos: &Position) -> i32 {
+        let phase = crate::eval::game_phase(pos);
+        let bucket = (pos.pawn_hash() as usize) & 16383;
+        let side = pos.side_to_move() as usize;
+        let mg = self.pawn_corr[bucket][side][0];
+        let eg = self.pawn_corr[bucket][side][1];
+        let interp = (mg * phase + eg * (24 - phase)) / 24;
+        interp / 256
+    }
+
+    #[inline]
+    pub fn mat_correction(&self, _pos: &Position) -> i32 {
+        // 4.3b will wire material_hash; stub returns 0 for 4.2
+        0
+    }
+
+    #[inline]
+    pub fn correction(&self, pos: &Position) -> i32 {
+        self.pawn_correction(pos) + self.mat_correction(pos)
+    }
+
+    pub fn update_pawn_correction(&mut self, pos: &Position, bonus: i32) {
+        let phase = crate::eval::game_phase(pos);
+        let bucket = (pos.pawn_hash() as usize) & 16383;
+        let side = pos.side_to_move() as usize;
+        // Compensation so applied delta at observed phase equals bonus
+        let denom = phase * phase + (24 - phase) * (24 - phase);
+        let c = if denom == 0 { 1 } else { 576 / denom };
+        let mg_bonus = bonus * phase / 24 * c;
+        let eg_bonus = bonus * (24 - phase) / 24 * c;
+        Self::corr_gravity(&mut self.pawn_corr[bucket][side][0], mg_bonus);
+        Self::corr_gravity(&mut self.pawn_corr[bucket][side][1], eg_bonus);
+    }
+
+    pub fn update_mat_correction(&mut self, _pos: &Position, _bonus: i32) {
+        // 4.3b will implement material correction; stub for 4.2
+    }
+
+    pub fn update_correction(&mut self, pos: &Position, bonus: i32) {
+        self.update_pawn_correction(pos, bonus);
+        self.update_mat_correction(pos, bonus);
     }
 }
 

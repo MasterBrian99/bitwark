@@ -256,10 +256,9 @@ pub fn negamax(
         return quiescence(pos, alpha, beta, ply, ctx);
     }
 
-    // 4.1: TT eval reuse — use stored eval instead of recomputing when available.
-    // Stored eval is deterministic per position, so bench stays bit-identical (21,205,791).
-    let static_eval = if let Some(hit) = tt_hit_for_se {
-        // Guard mate-range garbage (should never be stored, but belt-and-braces)
+    // 4.1+4.2: TT eval reuse + pawn correction (mg/eg pair).
+    // TT stores raw eval; correction applied after.
+    let raw_eval = if let Some(hit) = tt_hit_for_se {
         if hit.eval.abs() <= 30000 {
             hit.eval
         } else {
@@ -268,6 +267,7 @@ pub fn negamax(
     } else {
         crate::eval::evaluate_cached(pos, &mut ctx.pawn_cache)
     };
+    let static_eval = raw_eval + ctx.correction(pos);
 
     // Singular extensions: verification search (Phase 3.2) — single ext, SF-style verif
     let mut singular_move: Option<Move> = None;
@@ -698,11 +698,29 @@ pub fn negamax(
             pos.hash(),
             best_move,
             best_score,
-            static_eval,
+            raw_eval,
             store_depth,
             bound,
             ply,
         );
+    }
+
+    // 4.2: pawn correction update (mg/eg pair, SF-style)
+    if !ctx.stop.load(Ordering::Relaxed)
+        && !in_check
+        && excluded.is_none()
+        && ply < MAX_PLY
+        && best_score.abs() < MATE - MAX_PLY as i32
+        && static_eval.abs() < MATE - MAX_PLY as i32
+    {
+        let best_is_some = best_move.is_some();
+        let is_capture = best_move.map(|m| !is_quiet(pos, m)).unwrap_or(false);
+        if !is_capture && (best_score > static_eval) == best_is_some {
+            let bonus = ((best_score - static_eval) * depth * if best_is_some { 12 } else { 18 } / 128)
+                .clamp(-4096, 4096);
+            let bonus = 1061 * bonus / 1024;
+            ctx.update_correction(pos, bonus);
+        }
     }
 
     if best_score > original_alpha {

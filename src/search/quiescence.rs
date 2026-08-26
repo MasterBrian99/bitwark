@@ -44,7 +44,8 @@ pub fn quiescence(
     }
 
     if ply >= MAX_PLY - 1 {
-        return evaluate_cached(pos, &mut ctx.pawn_cache);
+        let raw = evaluate_cached(pos, &mut ctx.pawn_cache);
+        return raw + ctx.correction(pos);
     }
 
     ctx.nodes += 1;
@@ -70,12 +71,23 @@ pub fn quiescence(
         }
     }
 
-    let stand_pat = evaluate_cached(pos, &mut ctx.pawn_cache);
+    // 4.1+4.2: reuse TT eval if available, then apply pawn+mat correction
+    // For qsearch, correction is currently disabled to avoid pruning mate lines (see 4.2)
+    let raw_stand_pat = if let Some(hit) = tt_hit {
+        if hit.eval.abs() <= 30000 {
+            hit.eval
+        } else {
+            evaluate_cached(pos, &mut ctx.pawn_cache)
+        }
+    } else {
+        evaluate_cached(pos, &mut ctx.pawn_cache)
+    };
+    let stand_pat = raw_stand_pat; // + ctx.correction(pos) — disabled for qsearch for now
 
     if stand_pat >= beta {
-        // Store TT entry for stand-pat cutoff
+        // Store TT entry for stand-pat cutoff — store raw (SF)
         ctx.tt
-            .store(pos.hash(), None, beta, stand_pat, 0, Bound::Lower, ply);
+            .store(pos.hash(), None, beta, raw_stand_pat, 0, Bound::Lower, ply);
         return beta;
     }
     if stand_pat > alpha {
@@ -168,8 +180,15 @@ pub fn quiescence(
             best_move = Some(mv);
         }
         if score >= beta {
-            ctx.tt
-                .store(pos.hash(), Some(mv), score, stand_pat, 0, Bound::Lower, ply);
+            ctx.tt.store(
+                pos.hash(),
+                Some(mv),
+                score,
+                raw_stand_pat,
+                0,
+                Bound::Lower,
+                ply,
+            );
             return beta;
         }
         if score > alpha {
@@ -177,14 +196,14 @@ pub fn quiescence(
         }
     }
 
-    // TT store for qsearch result
+    // TT store for qsearch result — store raw
     let bound = if best_move.is_some() && alpha > orig_alpha {
         Bound::Exact
     } else {
         Bound::Upper
     };
     ctx.tt
-        .store(pos.hash(), best_move, alpha, stand_pat, 0, bound, ply);
+        .store(pos.hash(), best_move, alpha, raw_stand_pat, 0, bound, ply);
 
     alpha
 }
