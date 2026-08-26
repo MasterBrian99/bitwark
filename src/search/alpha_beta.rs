@@ -256,7 +256,18 @@ pub fn negamax(
         return quiescence(pos, alpha, beta, ply, ctx);
     }
 
-    let static_eval = crate::eval::evaluate_cached(pos, &mut ctx.pawn_cache);
+    // 4.1: TT eval reuse — use stored eval instead of recomputing when available.
+    // Stored eval is deterministic per position, so bench stays bit-identical (21,205,791).
+    let static_eval = if let Some(hit) = tt_hit_for_se {
+        // Guard mate-range garbage (should never be stored, but belt-and-braces)
+        if hit.eval.abs() <= 30000 {
+            hit.eval
+        } else {
+            crate::eval::evaluate_cached(pos, &mut ctx.pawn_cache)
+        }
+    } else {
+        crate::eval::evaluate_cached(pos, &mut ctx.pawn_cache)
+    };
 
     // Singular extensions: verification search (Phase 3.2) — single ext, SF-style verif
     let mut singular_move: Option<Move> = None;
