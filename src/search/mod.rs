@@ -207,6 +207,8 @@ pub struct SearchContext<'a> {
     /// Per-ply quiets tried at this node (for history malus, 1.4).
     /// Only `0..quiets_cnt[ply]` is valid; stale entries are never read.
     pub quiets_stack: Box<[[Option<Move>; 218]; MAX_PLY]>,
+    /// Consecutive singular extensions along current line (SE cap, 3.2/3.3).
+    pub se_extensions: [u8; MAX_PLY],
 }
 
 impl<'a> SearchContext<'a> {
@@ -251,6 +253,7 @@ impl<'a> SearchContext<'a> {
             is_main,
             check_count: 1,
             quiets_stack: Box::new([[None; 218]; MAX_PLY]),
+            se_extensions: [0; MAX_PLY],
         }
     }
 
@@ -394,6 +397,8 @@ pub(crate) fn search_single(
         if stop.load(Ordering::Relaxed) {
             break;
         }
+        // Clear SE extension stack each iteration (otherwise stale counts leak across ID depths)
+        ctx.se_extensions = [0; MAX_PLY];
         if ctx.tc.should_hard_stop() {
             stop.store(true, Ordering::Relaxed);
             break;

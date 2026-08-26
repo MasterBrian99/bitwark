@@ -22,6 +22,16 @@ use crate::board::{bishop_attacks, knight_attacks, pawn_attacks, rook_attacks};
 use super::{MATE, MAX_PLY, SearchContext, quiescence::quiescence, tt::Bound};
 
 // ---------------------------------------------------------------------------
+// Singular extensions (Phase 3)
+// ---------------------------------------------------------------------------
+
+const SE_MIN_DEPTH: i32 = 8;
+const SE_TT_DEPTH_SLACK: i32 = 3;
+const SE_VERIF_RED: i32 = 3;
+const SE_MARGIN_PER_DEPTH: i32 = 4;
+const SE_EXT_CAP: u8 = 6;
+
+// ---------------------------------------------------------------------------
 // LMR table
 // ---------------------------------------------------------------------------
 
@@ -204,11 +214,17 @@ pub fn negamax(
         return alpha;
     }
 
+    // SE: initialize extension stack at root
+    if ply == 0 {
+        ctx.se_extensions[0] = 0;
+    }
     let mut tt_move: Option<Move> = None;
+    let mut tt_hit_for_se: Option<crate::search::tt::TtHit> = None;
     // When excluded is set, skip TT entirely (exclusion search uses same hash; storing would pollute)
     if excluded.is_none() {
         if let Some(hit) = ctx.tt.probe(pos.hash(), ply) {
             tt_move = hit.mv;
+            tt_hit_for_se = Some(hit);
             if (hit.depth as i32) >= depth {
                 match hit.bound {
                     Bound::Exact => return hit.score,
@@ -240,6 +256,44 @@ pub fn negamax(
     }
 
     let static_eval = crate::eval::evaluate_cached(pos, &mut ctx.pawn_cache);
+
+    // Singular extensions: verification search (Phase 3.2) — single ext, SF-style verif
+    let mut singular_move: Option<Move> = None;
+    let mut singular_ext: i32 = 0;
+    if excluded.is_none()
+        && tt_move.is_some()
+        && depth >= SE_MIN_DEPTH
+        && !ctx.stop.load(Ordering::Relaxed)
+        && ply < MAX_PLY - 1
+    {
+        if let Some(hit) = tt_hit_for_se {
+            let tt_depth_ok = (hit.depth as i32) >= depth - SE_TT_DEPTH_SLACK;
+            let is_lower = hit.bound == Bound::Lower;
+            let not_mate = hit.score.abs() < MATE - MAX_PLY as i32;
+            if tt_depth_ok && is_lower && not_mate && ctx.se_extensions[ply] < SE_EXT_CAP {
+                let margin = SE_MARGIN_PER_DEPTH * depth;
+                let beta_se = hit.score - margin;
+                let verif_depth = ((depth - 1) / 2).max(0);
+                let se_score = negamax(
+                    pos,
+                    verif_depth,
+                    beta_se - 1,
+                    beta_se,
+                    ply,
+                    can_null,
+                    tt_move,
+                    ctx,
+                );
+                if ctx.stop.load(Ordering::Relaxed) {
+                    return 0;
+                }
+                if se_score < beta_se {
+                    singular_ext = 1;
+                    singular_move = tt_move;
+                }
+            }
+        }
+    }
 
     // Razoring: shallow depth, eval far below alpha → qsearch verification
     if !is_pv && !in_check && depth <= 3 && static_eval.abs() < MATE - MAX_PLY as i32 {
@@ -372,8 +426,29 @@ pub fn negamax(
             return 0;
         }
 
+        // Singular extension for this move (Phase 3.2) — supports double
+        let ext: i32 = if Some(mv) == singular_move {
+            singular_ext
+        } else {
+            0
+        };
+        // Cap total extensions
+        let ext = if ctx.se_extensions[ply].saturating_add(ext as u8) > SE_EXT_CAP {
+            if SE_EXT_CAP > ctx.se_extensions[ply] {
+                (SE_EXT_CAP - ctx.se_extensions[ply]) as i32
+            } else {
+                0
+            }
+        } else {
+            ext
+        };
+        let next_se = ctx.se_extensions[ply].saturating_add(ext as u8);
+        if ply + 1 < MAX_PLY {
+            ctx.se_extensions[ply + 1] = next_se;
+        }
+
         let mut reduction = 0;
-        if !is_pv && !in_check && quiet && depth >= 3 && i >= 3 && !gives_check(pos, mv) {
+        if ext == 0 && !is_pv && !in_check && quiet && depth >= 3 && i >= 3 && !gives_check(pos, mv) {
             reduction = lmr_reduction(depth, i);
             reduction = reduction.clamp(1, depth - 2);
             if reduction < 0 {
@@ -385,7 +460,7 @@ pub fn negamax(
             pos.make_move(mv);
             let v = -negamax(
                 pos,
-                depth - 1 - reduction,
+                depth - 1 + ext - reduction,
                 -alpha - 1,
                 -alpha,
                 ply + 1,
@@ -401,7 +476,7 @@ pub fn negamax(
                 pos.make_move(mv);
                 let v2 = -negamax(
                     pos,
-                    depth - 1,
+                    depth - 1 + ext,
                     -alpha - 1,
                     -alpha,
                     ply + 1,
@@ -417,7 +492,7 @@ pub fn negamax(
                     pos.make_move(mv);
                     let v3 = -negamax(
                         pos,
-                        depth - 1,
+                        depth - 1 + ext,
                         -beta,
                         -alpha,
                         ply + 1,
@@ -438,7 +513,16 @@ pub fn negamax(
             }
         } else if i == 0 {
             pos.make_move(mv);
-            let v = -negamax(pos, depth - 1, -beta, -alpha, ply + 1, true, None, ctx);
+            let v = -negamax(
+                pos,
+                depth - 1 + ext,
+                -beta,
+                -alpha,
+                ply + 1,
+                true,
+                None,
+                ctx,
+            );
             pos.unmake_move(mv);
             if ctx.stop.load(Ordering::Relaxed) {
                 return 0;
@@ -448,7 +532,7 @@ pub fn negamax(
             pos.make_move(mv);
             let v = -negamax(
                 pos,
-                depth - 1,
+                depth - 1 + ext,
                 -alpha - 1,
                 -alpha,
                 ply + 1,
@@ -462,7 +546,16 @@ pub fn negamax(
             }
             if v > alpha {
                 pos.make_move(mv);
-                let v2 = -negamax(pos, depth - 1, -beta, -alpha, ply + 1, true, None, ctx);
+                let v2 = -negamax(
+                    pos,
+                    depth - 1 + ext,
+                    -beta,
+                    -alpha,
+                    ply + 1,
+                    true,
+                    None,
+                    ctx,
+                );
                 pos.unmake_move(mv);
                 if ctx.stop.load(Ordering::Relaxed) {
                     return 0;
