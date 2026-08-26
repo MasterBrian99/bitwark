@@ -318,7 +318,7 @@ impl<'a> SearchContext<'a> {
 
     #[inline]
     pub fn mat_correction(&self, _pos: &Position) -> i32 {
-        // 4.3b will wire material_hash; stub returns 0 for 4.2
+        // 4.3b wired but reverted — material correction hurt (-21 Elo @80), keep stub for now
         0
     }
 
@@ -341,7 +341,7 @@ impl<'a> SearchContext<'a> {
     }
 
     pub fn update_mat_correction(&mut self, _pos: &Position, _bonus: i32) {
-        // 4.3b will implement material correction; stub for 4.2
+        // 4.3b reverted
     }
 
     pub fn update_correction(&mut self, pos: &Position, bonus: i32) {
