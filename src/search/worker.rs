@@ -103,19 +103,20 @@ pub fn search(
     };
 
     std::thread::scope(|s| {
-        // Spawn helpers (thread_id 1..threads-1).
+        // Spawn helpers (thread_id 1..threads-1) with depth offsets to de-correlate early iterations.
         for tid in 1..threads {
             let pos_c = pos.clone();
             let limits_c = helper_limits.clone();
             let tc_c = Arc::clone(tc);
             let tt_c = Arc::clone(tt);
             let total_c = Arc::clone(&total_nodes);
+            let helper_depth = (1 + (tid % 2)) as u8;
             // `stop` is borrowed from the outer scope — scoped threads allow this.
             s.spawn(move || {
                 let mut pos_c = pos_c;
                 let mut dummy = |_: SearchEvent| {};
                 crate::search::search_single(
-                    &mut pos_c, limits_c, stop, &tc_c, &tt_c, &total_c, tid, false, 1, &mut dummy,
+                    &mut pos_c, limits_c, stop, &tc_c, &tt_c, &total_c, tid, false, helper_depth, &mut dummy,
                 );
             });
         }
