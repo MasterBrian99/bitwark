@@ -15,6 +15,13 @@ use crate::search::ContHistory;
 
 pub static ZERO_CONT: ContHistory = [[[[0; 64]; 6]; 64]; 6];
 
+/// Base score for losing captures (SEE < 0) after demotion; history quiets are ±16384.
+#[allow(dead_code)]
+pub const LOSING_CAPTURE_BASE: i32 = -20_000;
+/// Scores below this were already SEE-checked and demoted (see value in score).
+#[allow(dead_code)]
+pub const DEMOTE_MARK: i32 = -19_000;
+
 // Piece values for MVV-LVA (centipawns, same as eval material but King = 20000).
 fn piece_value(pt: PieceType) -> i32 {
     match pt {
@@ -89,13 +96,9 @@ pub fn score_move(
         let victim_val = piece_value(cap.piece_type());
         let promo_bonus = mv.promotion.map_or(0, piece_value);
         let mvv = 10 * victim_val - attacker_val + promo_bonus;
-        let see_val = crate::search::see::see(pos, mv);
-        if see_val >= 0 {
-            return 800_000 + mvv;
-        } else {
-            // Losing capture — below history quiets (history is -16384..16384)
-            return -20_000 + see_val;
-        }
+        // Phase 2: SEE-free — all captures score 800k + MVV, losing ones are
+        // demoted lazily at pick time via LOSING_CAPTURE_BASE + see.
+        return 800_000 + mvv;
     }
 
     // Non-capture promotion (quiet promo).
@@ -134,6 +137,84 @@ pub fn score_move(
         }
     }
     // Clamp to a bucket below killers/counter: 490k/480k > 16k
+    best.clamp(-16_384, 16_384)
+}
+
+/// SEE-aware variant (old score_move) — used only for root ordering to
+/// keep bit-identical decisions. Interior nodes and qsearch use the SEE-free
+/// `score_move` with lazy demotion at pick time (Phase 2).
+pub fn score_move_with_see(
+    pos: &Position,
+    mv: Move,
+    tt_move: Option<Move>,
+    killers: &[Option<Move>; 2],
+    counter: Option<Move>,
+    history: &[[[i32; 64]; 64]; 2],
+    prev1: Option<(PieceType, Square)>,
+    cont1: &ContHistory,
+    prev2: Option<(PieceType, Square)>,
+    cont2: &ContHistory,
+    ply: usize,
+) -> i32 {
+    if let Some(tt) = tt_move
+        && tt == mv
+    {
+        return 1_000_000;
+    }
+    let moving = match pos.piece_at(mv.from) {
+        Some(p) => p,
+        None => return 0,
+    };
+    let attacker_val = piece_value(moving.piece_type());
+    let captured = if let Some(p) = pos.piece_at(mv.to) {
+        Some(p)
+    } else if moving.piece_type() == PieceType::Pawn && pos.en_passant() == Some(mv.to) {
+        Some(Piece::new(moving.color().opposite(), PieceType::Pawn))
+    } else {
+        None
+    };
+    if let Some(cap) = captured {
+        let victim_val = piece_value(cap.piece_type());
+        let promo_bonus = mv.promotion.map_or(0, piece_value);
+        let mvv = 10 * victim_val - attacker_val + promo_bonus;
+        let see_val = crate::search::see::see(pos, mv);
+        if see_val >= 0 {
+            return 800_000 + mvv;
+        } else {
+            return LOSING_CAPTURE_BASE + see_val;
+        }
+    }
+    if let Some(pt) = mv.promotion {
+        return 600_000 + piece_value(pt);
+    }
+    if killers[0] == Some(mv) {
+        return 500_000;
+    }
+    if killers[1] == Some(mv) {
+        return 490_000;
+    }
+    if let Some(cm) = counter
+        && cm == mv
+        && is_quiet_for_order(pos, mv)
+    {
+        return 480_000;
+    }
+    let side = pos.side_to_move() as usize;
+    let h = history[side][mv.from.index() as usize][mv.to.index() as usize];
+    let cur_pt = moving.piece_type();
+    let mut best = h;
+    if let Some((pp, ps)) = prev1 {
+        let c1 = cont1[pp as usize][ps.index() as usize][cur_pt as usize][mv.to.index() as usize];
+        if c1 > best {
+            best = c1;
+        }
+    }
+    if let Some((pp, ps)) = prev2 {
+        let c2 = cont2[pp as usize][ps.index() as usize][cur_pt as usize][mv.to.index() as usize];
+        if c2 > best {
+            best = c2;
+        }
+    }
     best.clamp(-16_384, 16_384)
 }
 
@@ -343,7 +424,9 @@ mod tests {
 
     #[test]
     fn see_losing_capture_below_history() {
-        // Queen takes pawn defended by pawn — losing per SEE, should be below history quiets.
+        // Queen takes pawn defended by pawn — losing per SEE. With the old
+        // SEE-bucketed scoring it sorted below quiets; with Phase 2's SEE-free
+        // scoring it scores 800k+MVV and is demoted lazily at pick time.
         let pos = parse_fen("4k3/8/2p1p3/3p4/3Q4/8/8/4K3 w - - 0 1").unwrap();
         let losing = crate::board::mv::Move::parse_uci("d4d5").unwrap(); // QxP defended
         let quiet = crate::board::mv::Move::parse_uci("d4e4").unwrap();
@@ -352,15 +435,24 @@ mod tests {
         // Give quiet max history
         history[Color::White as usize][quiet.from.index() as usize][quiet.to.index() as usize] =
             16384;
-        let s_losing = score_move(
+        // SEE-aware scoring (root/with_see) puts losing below quiet
+        let s_losing_see = score_move_with_see(
             &pos, losing, None, &dummy_k, None, &history, None, &ZERO_CONT, None, &ZERO_CONT, 0,
         );
         let s_quiet = score_move(
             &pos, quiet, None, &dummy_k, None, &history, None, &ZERO_CONT, None, &ZERO_CONT, 0,
         );
         assert!(
-            s_losing < s_quiet,
-            "losing capture {s_losing} should be below history quiet {s_quiet}"
+            s_losing_see < s_quiet,
+            "SEE-aware losing capture {s_losing_see} should be below history quiet {s_quiet}"
+        );
+        // SEE-free scoring (negamax/qsearch hot path) puts it in the winning bucket
+        let s_losing_free = score_move(
+            &pos, losing, None, &dummy_k, None, &history, None, &ZERO_CONT, None, &ZERO_CONT, 0,
+        );
+        assert!(
+            s_losing_free > 700_000,
+            "SEE-free losing capture should score 800k+MVV, got {s_losing_free}"
         );
         // But winning capture should still be above killer
         let pos_win = parse_fen("r3k3/8/8/8/8/8/8/Q3K3 w - - 0 1").unwrap();
