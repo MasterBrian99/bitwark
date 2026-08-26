@@ -159,6 +159,7 @@ pub fn negamax(
     beta: i32,
     ply: usize,
     can_null: bool,
+    excluded: Option<Move>,
     ctx: &mut SearchContext,
 ) -> i32 {
     let is_pv = beta > alpha + 1;
@@ -204,20 +205,24 @@ pub fn negamax(
     }
 
     let mut tt_move: Option<Move> = None;
-    if let Some(hit) = ctx.tt.probe(pos.hash(), ply) {
-        tt_move = hit.mv;
-        if (hit.depth as i32) >= depth {
-            match hit.bound {
-                Bound::Exact => return hit.score,
-                Bound::Lower if hit.score >= beta => return hit.score,
-                Bound::Upper if hit.score <= alpha => return hit.score,
-                _ => {}
+    // When excluded is set, skip TT entirely (exclusion search uses same hash; storing would pollute)
+    if excluded.is_none() {
+        if let Some(hit) = ctx.tt.probe(pos.hash(), ply) {
+            tt_move = hit.mv;
+            if (hit.depth as i32) >= depth {
+                match hit.bound {
+                    Bound::Exact => return hit.score,
+                    Bound::Lower if hit.score >= beta => return hit.score,
+                    Bound::Upper if hit.score <= alpha => return hit.score,
+                    _ => {}
+                }
             }
         }
     }
 
     // IIR: no TT move at decent depth → search shallower to get a move
-    if tt_move.is_none() && depth >= 4 {
+    // Do not apply IIR inside the exclusion search (tt_move is forced None there).
+    if excluded.is_none() && tt_move.is_none() && depth >= 4 {
         depth -= 1;
     }
 
@@ -259,7 +264,16 @@ pub fn negamax(
             ctx.prev_stack[ply] = None;
         }
         pos.make_null_move();
-        let score = -negamax(pos, depth - 1 - r, -beta, -beta + 1, ply + 1, false, ctx);
+        let score = -negamax(
+            pos,
+            depth - 1 - r,
+            -beta,
+            -beta + 1,
+            ply + 1,
+            false,
+            None,
+            ctx,
+        );
         pos.unmake_null_move();
         if ctx.stop.load(Ordering::Relaxed) {
             return 0;
@@ -326,6 +340,9 @@ pub fn negamax(
     let list_len = list.len;
     for i in 0..list_len {
         let mv = list.pick_best(i);
+        if Some(mv) == excluded {
+            continue;
+        }
         // Record prev_stack for child: piece type before move, to square (10a)
         if ply < super::MAX_PLY {
             if let Some(pc) = pos.piece_at(mv.from) {
@@ -373,6 +390,7 @@ pub fn negamax(
                 -alpha,
                 ply + 1,
                 true,
+                None,
                 ctx,
             );
             pos.unmake_move(mv);
@@ -381,14 +399,32 @@ pub fn negamax(
             }
             if v > alpha {
                 pos.make_move(mv);
-                let v2 = -negamax(pos, depth - 1, -alpha - 1, -alpha, ply + 1, true, ctx);
+                let v2 = -negamax(
+                    pos,
+                    depth - 1,
+                    -alpha - 1,
+                    -alpha,
+                    ply + 1,
+                    true,
+                    None,
+                    ctx,
+                );
                 pos.unmake_move(mv);
                 if ctx.stop.load(Ordering::Relaxed) {
                     return 0;
                 }
                 if v2 > alpha && is_pv {
                     pos.make_move(mv);
-                    let v3 = -negamax(pos, depth - 1, -beta, -alpha, ply + 1, true, ctx);
+                    let v3 = -negamax(
+                        pos,
+                        depth - 1,
+                        -beta,
+                        -alpha,
+                        ply + 1,
+                        true,
+                        None,
+                        ctx,
+                    );
                     pos.unmake_move(mv);
                     if ctx.stop.load(Ordering::Relaxed) {
                         return 0;
@@ -402,7 +438,7 @@ pub fn negamax(
             }
         } else if i == 0 {
             pos.make_move(mv);
-            let v = -negamax(pos, depth - 1, -beta, -alpha, ply + 1, true, ctx);
+            let v = -negamax(pos, depth - 1, -beta, -alpha, ply + 1, true, None, ctx);
             pos.unmake_move(mv);
             if ctx.stop.load(Ordering::Relaxed) {
                 return 0;
@@ -410,14 +446,23 @@ pub fn negamax(
             v
         } else {
             pos.make_move(mv);
-            let v = -negamax(pos, depth - 1, -alpha - 1, -alpha, ply + 1, true, ctx);
+            let v = -negamax(
+                pos,
+                depth - 1,
+                -alpha - 1,
+                -alpha,
+                ply + 1,
+                true,
+                None,
+                ctx,
+            );
             pos.unmake_move(mv);
             if ctx.stop.load(Ordering::Relaxed) {
                 return 0;
             }
             if v > alpha {
                 pos.make_move(mv);
-                let v2 = -negamax(pos, depth - 1, -beta, -alpha, ply + 1, true, ctx);
+                let v2 = -negamax(pos, depth - 1, -beta, -alpha, ply + 1, true, None, ctx);
                 pos.unmake_move(mv);
                 if ctx.stop.load(Ordering::Relaxed) {
                     return 0;
@@ -542,15 +587,17 @@ pub fn negamax(
         Bound::Exact
     };
     let store_depth = depth.clamp(0, 127) as u8;
-    ctx.tt.store(
-        pos.hash(),
-        best_move,
-        best_score,
-        static_eval,
-        store_depth,
-        bound,
-        ply,
-    );
+    if excluded.is_none() {
+        ctx.tt.store(
+            pos.hash(),
+            best_move,
+            best_score,
+            static_eval,
+            store_depth,
+            bound,
+            ply,
+        );
+    }
 
     if best_score > original_alpha {
         alpha

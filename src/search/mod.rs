@@ -481,6 +481,7 @@ pub(crate) fn search_single(
                     VALUE_INFINITE,
                     1,
                     true,
+                    None,
                     &mut ctx,
                 );
                 pos.unmake_move(mv);
@@ -864,13 +865,13 @@ fn root_search(
         }
         pos.make_move(mv);
         let score = if i == 0 {
-            -alpha_beta::negamax(pos, depth - 1, -beta, -alpha, 1, true, ctx)
+            -alpha_beta::negamax(pos, depth - 1, -beta, -alpha, 1, true, None, ctx)
         } else {
             // PVS zero-window
-            let v = -alpha_beta::negamax(pos, depth - 1, -alpha - 1, -alpha, 1, true, ctx);
+            let v = -alpha_beta::negamax(pos, depth - 1, -alpha - 1, -alpha, 1, true, None, ctx);
             if v > alpha && v < beta {
                 // Re-search with full window (PV node)
-                -alpha_beta::negamax(pos, depth - 1, -beta, -alpha, 1, true, ctx)
+                -alpha_beta::negamax(pos, depth - 1, -beta, -alpha, 1, true, None, ctx)
             } else {
                 v
             }
